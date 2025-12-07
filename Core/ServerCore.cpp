@@ -1,8 +1,5 @@
-// ServerCore.cpp (핵심 로직)
 #include "ServerCore.h"
-#include <stdexcept>
 
-// 전역 메모리 풀 (실제론 싱글톤으로 관리)
 CMemoryPool g_overlapPool(100);
 
 bool CIOCPServer::Init(int port)

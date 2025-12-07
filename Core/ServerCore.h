@@ -1,6 +1,5 @@
-// ServerCore.h (주요 구조체 및 클래스 선언)
-
 #include "pch.h"
+#include "Memory/MemoryPool.h"
 // 클라이언트 세션 정보 (CompletionKey로 사용)
 class CSession
 {

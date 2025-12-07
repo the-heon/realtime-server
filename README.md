@@ -1,5 +1,11 @@
-c_cpp_properties.json 파일 설정 (window API)
-```
+# Window Vscode 실행 방법
+- https://www.msys2.org/ 설치
+- c_cpp_properties.json 파일 설정 (window API)
+  - MSYS2 MinGW 64-bit 터미널 실행
+  - pacman -Syu
+  - pacman -S mingw-w64-ucrt-x86_64-toolchain
+  -  C:\msys64\ucrt64\bin (Path 환경변수 등록)
+```json
 {
   "configurations": [
     {
@@ -19,4 +25,4 @@ c_cpp_properties.json 파일 설정 (window API)
   ],
   "version": 4
 }
-```  
+```
