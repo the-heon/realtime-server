@@ -26,3 +26,9 @@
   "version": 4
 }
 ```
+
+
+# protoc 설치 (v33.1)
+- https://github.com/protocolbuffers/protobuf/releases/tag/v33.2
+- 시스템 환경변수 Path 설정
+- ```protoc --cpp_out=. Packet.proto ``` 

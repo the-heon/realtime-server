@@ -1,14 +1,7 @@
-#include "pch.h"
-#include "Memory/MemoryPool.h"
-// 클라이언트 세션 정보 (CompletionKey로 사용)
-class CSession
-{
-public:
-    SOCKET sock = INVALID_SOCKET;
-    sockaddr_in addr = {};
-    // ... 추가 세션 정보 (ID, 상태 등)
-};
-
+#include "../pch.h"
+#include "../Packet/PacketHeader.h"
+#include "../Memory/memoryPool.h"
+#include "CSession.h"
 // 전역 메모리 풀 (예시)
 extern CMemoryPool g_overlapPool;
 

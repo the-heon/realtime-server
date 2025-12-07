@@ -2,6 +2,7 @@
 #pragma once
 
 // C/C++ 표준 라이브러리 (자주 사용되는 것)
+#include <WinSock2.h>
 #include <iostream>
 #include <vector>
 #include <string>

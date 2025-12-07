@@ -1,5 +1,5 @@
 // MemoryPool.h
-#include "pch.h"
+
 
 // I/O 타입 정의
 enum class IoType { RECV, SEND, ACCEPT };
