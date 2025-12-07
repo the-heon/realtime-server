@@ -1,0 +1,22 @@
+
+
+syntax = "proto3"; // 사용할 Protobuf 버전
+package Protocol; // 생성될 C++ 클래스들이 포함될 네임스페이스
+
+// C_LOGIN 메시지 정의 (클라이언트 -> 서버)
+message C_LOGIN {
+    // 필드 정의: [타입] [필드명] = [필드 번호];
+    string account_id = 1; 
+    string password = 2;
+}
+
+// S_LOGIN 메시지 정의 (서버 -> 클라이언트)
+message S_LOGIN {
+    bool success = 1;
+    string message = 2;
+}
+
+// C_CHAT 메시지 정의 (클라이언트 -> 서버)
+message C_CHAT {
+    string message = 1;
+}
