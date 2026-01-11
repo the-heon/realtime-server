@@ -13,7 +13,7 @@
 #include <mutex> // 스레드 동기화 관련
 #include <functional> // CPacketManager에서 PacketHandlerFunc에 필요
 #include <map>        // CPacketManager에서 핸들러 맵에 필요
-
+#include <thread>
 // Windows API 및 Winsock
 #include <winsock2.h>
 #include <ws2tcpip.h>

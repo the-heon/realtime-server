@@ -4,7 +4,7 @@
 int main()
 {
     try {
-        CIOCPServer server;
+        ServerCore server;
         if (server.Init(7777))
         {
             server.Start();

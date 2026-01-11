@@ -1,6 +1,7 @@
-#include "CPacketManager.h" 
+#include "PacketManager.h" 
 #include "PacketHeader.h" 
-// CSession, std::map, std::function, uint16_t는 pch.h를 통해 인식됩니다.
+#include "ServerSession.h"
+// ServerSession, std::map, std::function, uint16_t는 pch.h를 통해 인식됩니다.
 
 
 // ==========================================================
@@ -8,7 +9,7 @@
 // ==========================================================
 
 // 🚀 생성자
-CPacketManager::CPacketManager()
+PacketManager::PacketManager()
 {
     // 생성자에서는 특별한 초기화가 필요 없습니다.
     // m_handlers 맵은 자동으로 초기화됩니다.
@@ -16,7 +17,7 @@ CPacketManager::CPacketManager()
 
 // 📦 핸들러 등록
 // 특정 PacketID에 대한 처리 함수(핸들러)를 맵에 등록합니다.
-void CPacketManager::RegisterHandler(uint16_t packetId, PacketHandlerFunc handler)
+void PacketManager::RegisterHandler(uint16_t packetId, PacketHandlerFunc handler)
 {
     // emplace를 사용하여 맵에 (packetId, handler) 쌍을 삽입합니다.
     m_handlers.emplace(packetId, handler);
@@ -24,7 +25,7 @@ void CPacketManager::RegisterHandler(uint16_t packetId, PacketHandlerFunc handle
 
 // 🧠 패킷 처리 (Dispatcher 역할)
 // 수신된 전체 패킷 데이터에서 ID를 추출하여 등록된 핸들러를 호출합니다.
-void CPacketManager::HandlePacket(CSession* session, char* packetData, int size)
+void PacketManager::HandlePacket(ServerSession* ServerSession, char* packetData, int size)
 {
     // 패킷의 최소 크기 검사: 적어도 헤더 크기 이상이어야 합니다.
     if (size < sizeof(PacketHeader))
@@ -51,8 +52,8 @@ void CPacketManager::HandlePacket(CSession* session, char* packetData, int size)
     {
         // 핸들러가 존재하면 호출
         // it->second는 등록된 PacketHandlerFunc 함수 객체입니다.
-        // CSession*, Protobuf 본문 데이터 포인터, 본문 크기를 전달합니다.
-        it->second(session, payload, payloadSize);
+        // ServerSession*, Protobuf 본문 데이터 포인터, 본문 크기를 전달합니다.
+        it->second(ServerSession, payload, payloadSize);
     }
     else
     {

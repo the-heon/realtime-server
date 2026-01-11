@@ -1,6 +1,7 @@
-#include "CRecvBuffer.h"
+#include "RecvBuffer.h"
 #include "PacketHeader.h"
-bool CRecvBuffer::TryGetPacket(char*& outData, int& outSize)
+
+bool RecvBuffer::TryGetPacket(char*& outData, int& outSize)
 {
     // 1. 현재 버퍼에 최소한 헤더 크기만큼의 데이터가 있는지 확인
     if (GetDataSize() < sizeof(PacketHeader)) {

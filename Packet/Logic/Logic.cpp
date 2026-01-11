@@ -4,7 +4,7 @@
 #include "Packet.pb.h"      // Protobuf 메시지 정의 (Protocol::C_LOGIN 등)
 
 // C_LOGIN 패킷 처리 함수 구현
-void Handle_C_LOGIN(CSession* session, char* payload, int payloadSize)
+void Handle_C_LOGIN(ServerSession* ServerSession, char* payload, int payloadSize)
 {
     Protocol::C_LOGIN pkt;
     if (!pkt.ParseFromArray(payload, payloadSize))
@@ -25,7 +25,7 @@ void Handle_C_LOGIN(CSession* session, char* payload, int payloadSize)
     
     if (authSuccess)
     {
-        // session->SetAccountId(accountId);
+        // ServerSession->SetAccountId(accountId);
         resPkt.set_message("Login OK.");
     }
     else
@@ -34,11 +34,11 @@ void Handle_C_LOGIN(CSession* session, char* payload, int payloadSize)
     }
 
     // 세션의 Send 함수를 통해 클라이언트에 응답합니다.
-    session->Send(resPkt); 
+    ServerSession->Send(resPkt); 
 }
 
 // C_CHAT 패킷 처리 함수 구현
-void Handle_C_CHAT(CSession* session, char* payload, int payloadSize)
+void Handle_C_CHAT(ServerSession* ServerSession, char* payload, int payloadSize)
 {
     Protocol::C_CHAT pkt;
     if (!pkt.ParseFromArray(payload, payloadSize))
@@ -53,7 +53,7 @@ void Handle_C_CHAT(CSession* session, char* payload, int payloadSize)
 
     // 2. 브로드캐스트용 응답 패킷 생성
     Protocol::S_CHAT resPkt;
-    // resPkt.set_sender(session->GetAccountId()); // 발신자 정보 추가
+    // resPkt.set_sender(ServerSession->GetAccountId()); // 발신자 정보 추가
     resPkt.set_message(message);
 
     // 3. 채팅방/전체 서버에 브로드캐스트 (생략)

@@ -5,7 +5,7 @@
 enum class IoType { RECV, SEND, ACCEPT };
 
 // OVERLAPPED 구조체 확장 (재사용될 객체)
-struct COverlappedEx
+struct OverlappedEx
 {
     OVERLAPPED overlapped;
     WSABUF wsaBuf;
@@ -21,38 +21,38 @@ struct COverlappedEx
     }
 };
 
-class CMemoryPool
+class MemoryPool
 {
 public:
-    CMemoryPool(int initialCount) {
+    MemoryPool(int initialCount) {
         for (int i = 0; i < initialCount; ++i) {
-            auto obj = new COverlappedEx();
+            auto obj = new OverlappedEx();
             m_pool.push(obj);
         }
     }
 
-    ~CMemoryPool() {
+    ~MemoryPool() {
         while (!m_pool.empty()) {
             delete m_pool.front();
             m_pool.pop();
         }
     }
 
-    COverlappedEx* Allocate() {
+    OverlappedEx* Allocate() {
         if (m_pool.empty()) {
             // 풀이 비면 새로 생성 (실제 서버는 여기서 더 많이 확보)
-            return new COverlappedEx();
+            return new OverlappedEx();
         }
-        COverlappedEx* obj = m_pool.front();
+        OverlappedEx* obj = m_pool.front();
         m_pool.pop();
         obj->Reset();
         return obj;
     }
 
-    void Deallocate(COverlappedEx* obj) {
+    void Deallocate(OverlappedEx* obj) {
         m_pool.push(obj);
     }
 
 private:
-    std::queue<COverlappedEx*> m_pool;
+    std::queue<OverlappedEx*> m_pool;
 };

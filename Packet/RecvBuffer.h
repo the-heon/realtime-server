@@ -1,9 +1,9 @@
 
-class CRecvBuffer
+class RecvBuffer
 {
 public:
     // 생성자: 버퍼 용량을 지정하여 초기화
-    CRecvBuffer(int capacity);
+    RecvBuffer(int capacity);
 
     // IOCP 수신 완료 시 호출: 실제로 받은 크기(size)만큼 쓰기 위치(m_head)를 이동
     void Write(int size); // WSARecv 완료 시 호출

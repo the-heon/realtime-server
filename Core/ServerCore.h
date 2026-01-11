@@ -1,11 +1,11 @@
-#include "../pch.h"
 #include "../Packet/PacketHeader.h"
 #include "../Memory/memoryPool.h"
-#include "CSession.h"
+#include "ServerSession.h"
+#include "../pch.h"
 // 전역 메모리 풀 (예시)
-extern CMemoryPool g_overlapPool;
+extern MemoryPool g_overlapPool;
 
-class CIOCPServer
+class ServerCore
 {
 public:
     bool Init(int port);
@@ -14,9 +14,9 @@ public:
 private:
     void StartWorkerThreads();
     void WorkerThread();
-    void HandleRecv(CSession* session, DWORD bytes);
-    void HandlePacket(CSession* session, const char* data, int size);
-    void PostRecv(CSession* session);
+    void HandleRecv(ServerSession* ServerSession, DWORD bytes);
+    void HandlePacket(ServerSession* ServerSession, const char* data, int size);
+    void PostRecv(ServerSession* ServerSession);
 
 private:
     HANDLE m_hIOCP = INVALID_HANDLE_VALUE;
