@@ -1,6 +1,5 @@
 // GameLogic.cpp
-
-#include "CPacketManager.h" // 핸들러 함수 선언을 위해
+#include "Logic.h"
 #include "Packet.pb.h"      // Protobuf 메시지 정의 (Protocol::C_LOGIN 등)
 
 // C_LOGIN 패킷 처리 함수 구현

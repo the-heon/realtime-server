@@ -1,58 +1,55 @@
-// MemoryPool.h
+#pragma once
 #include <queue>
-
-// I/O 타입 정의
-enum class IoType { RECV, SEND, ACCEPT };
-
-// OVERLAPPED 구조체 확장 (재사용될 객체)
-struct OverlappedEx
-{
-    OVERLAPPED overlapped;
-    WSABUF wsaBuf;
-    IoType type;
-    int bufferSize;
-    char buffer[4096]; // 임시 버퍼 공간 (실제 환경에선 별도 버퍼 풀 사용 권장)
-
-    void Reset() {
-        ZeroMemory(&overlapped, sizeof(overlapped));
-        wsaBuf.buf = buffer;
-        wsaBuf.len = sizeof(buffer);
-        type = IoType::RECV; // 기본은 수신
-    }
-};
+#include <mutex>
+#include "ServerSession.h" // IOContext 정의를 위해 필요
 
 class MemoryPool
 {
 public:
     MemoryPool(int initialCount) {
         for (int i = 0; i < initialCount; ++i) {
-            auto obj = new OverlappedEx();
+            // IOContext는 생성 시 type과 owner(session)가 필요하지만, 
+            // 풀에 미리 담아둘 때는 초기값이 중요하지 않으므로 기본값으로 생성합니다.
+            auto obj = new IOContext(EIOType::RECV, nullptr);
             m_pool.push(obj);
         }
     }
 
     ~MemoryPool() {
+        std::lock_guard<std::mutex> lock(m_lock);
         while (!m_pool.empty()) {
             delete m_pool.front();
             m_pool.pop();
         }
     }
 
-    OverlappedEx* Allocate() {
+    // 풀에서 하나 꺼내오기
+    IOContext* Allocate(EIOType type, ServerSession* session) {
+        std::lock_guard<std::mutex> lock(m_lock);
+        IOContext* obj = nullptr;
+
         if (m_pool.empty()) {
-            // 풀이 비면 새로 생성 (실제 서버는 여기서 더 많이 확보)
-            return new OverlappedEx();
+            obj = new IOContext(type, session);
+        } else {
+            obj = m_pool.front();
+            m_pool.pop();
+            // 꺼낸 객체를 현재 용도에 맞게 리셋
+            memset(&obj->overlapped, 0, sizeof(OVERLAPPED));
+            obj->ioType = type;
+            obj->serverSession = session;
         }
-        OverlappedEx* obj = m_pool.front();
-        m_pool.pop();
-        obj->Reset();
         return obj;
     }
 
-    void Deallocate(OverlappedEx* obj) {
+    // 다 쓴 객체 반납하기
+    void Deallocate(IOContext* obj) {
+        if (obj == nullptr) return;
+        std::lock_guard<std::mutex> lock(m_lock);
+        obj->serverSession = nullptr; // 세션 연결 해제
         m_pool.push(obj);
     }
 
 private:
-    std::queue<OverlappedEx*> m_pool;
+    std::mutex m_lock;
+    std::queue<IOContext*> m_pool;
 };
