@@ -1,92 +1,103 @@
 #include "ServerSession.h"
-#include <string.h>
-#include "MemoryPool.h"
+#include <cstring>
 #include "google/protobuf/message.h"
-
-extern MemoryPool g_ioContextPool;
+#include "../Utils/Logger.h"
 
 // IOContext 구현
-IOContext::IOContext(EIOType type, ServerSession* owner)
-    : ioType(type), serverSession(owner)
+IOContext::IOContext(EIOType type, std::shared_ptr<ServerSession> owner)
+    : ioType(type), session(std::move(owner))
 {
-    memset(&overlapped, 0, sizeof(OVERLAPPED));
+    std::memset(&overlapped, 0, sizeof(OVERLAPPED));
+}
+
+void IOContext::Reset(EIOType type, std::shared_ptr<ServerSession> owner)
+{
+    std::memset(&overlapped, 0, sizeof(OVERLAPPED));
+    ioType = type;
+    session = std::move(owner);
+    wsaBuf = {};
+    acceptSocket = INVALID_SOCKET;
 }
 
 // ServerSession 구현
-ServerSession::ServerSession()
-{
-    m_recvContext = new IOContext(EIOType::RECV, this);
-}
+ServerSession::ServerSession() = default;
 
 ServerSession::~ServerSession()
 {
     delete m_recvContext;
-    Disconnect();
 }
 
 void ServerSession::Init(SOCKET socket, const sockaddr_in& addr)
 {
     m_sock = socket;
     m_addr = addr;
-    // 버퍼 연결
-    m_recvContext->wsaBuf.buf = m_recvBuffer;
-    m_recvContext->wsaBuf.len = BUF_SIZE;
+    // shared_from_this()는 이 세션이 이미 shared_ptr로 소유되고 있어야 호출할 수
+    // 있으므로(make_shared 직후), 생성자가 아니라 여기서 recv context를 만듭니다.
+    m_recvContext = new IOContext(EIOType::RECV, shared_from_this());
 }
 
-void ServerSession::Disconnect()
+bool ServerSession::Disconnect()
 {
-    if (m_sock != INVALID_SOCKET)
-    {
+    bool already = m_disconnected.exchange(true);
+    if (!already && m_sock != INVALID_SOCKET) {
         closesocket(m_sock);
         m_sock = INVALID_SOCKET;
     }
+    return !already;
 }
 
-bool ServerSession::Send(const google::protobuf::Message& message)
+bool ServerSession::SendInternal(uint16_t packetId, const google::protobuf::Message& message)
 {
-    // 1. 패킷 크기 계산 및 할당
-    int payloadSize = static_cast<int>(message.ByteSizeLong());
-    int totalSize = payloadSize + sizeof(uint32_t); // 패킷ID(또는 헤더 크기) 포함
+    if (IsDisconnected()) {
+        return false;
+    }
 
-    // 2. 전송용 IOContext 할당 (메모리 풀 사용)
-    IOContext* sendContext = g_ioContextPool.Allocate(EIOType::SEND, this);
-    
-    // 3. 데이터 직렬화 (간단한 헤더 구조: [Size(4)][Data...])
-    // 실제 프로젝트의 헤더 구조에 맞게 수정하세요.
-    char* targetBuf = sendContext->buffer; // IOContext에 정의된 buffer 사용
-    
-    // 예시: 첫 4바이트에 패킷 아이디나 크기 기록 (여기선 간단히)
-    // message.SerializeToArray(targetBuf + sizeof(uint32_t), payloadSize);
-    
-    // 실제 구현: Protobuf 메시지를 버퍼에 직렬화
-    if (!message.SerializeToArray(targetBuf, payloadSize))
-    {
+    int payloadSize = static_cast<int>(message.ByteSizeLong());
+    int totalSize = static_cast<int>(sizeof(PacketHeader)) + payloadSize;
+
+    if (totalSize > IOContext::MAX_BUF_SIZE) {
+        LOG_ERROR("Send: packet too large (" << totalSize << " bytes), packetId=" << packetId);
+        return false;
+    }
+
+    IOContext* sendContext = g_ioContextPool.Allocate(EIOType::SEND, shared_from_this());
+
+    // [PacketHeader][Protobuf 직렬화 데이터] 형태로 버퍼를 채웁니다.
+    PacketHeader* header = reinterpret_cast<PacketHeader*>(sendContext->buffer);
+    header->packetSize = static_cast<uint16_t>(payloadSize);
+    header->packetId = packetId;
+
+    if (!message.SerializeToArray(sendContext->buffer + sizeof(PacketHeader), payloadSize)) {
         g_ioContextPool.Deallocate(sendContext);
         return false;
     }
 
-    sendContext->wsaBuf.buf = targetBuf;
-    sendContext->wsaBuf.len = payloadSize;
+    sendContext->wsaBuf.buf = sendContext->buffer;
+    sendContext->wsaBuf.len = totalSize;
 
-    // 4. 비동기 전송 요청
     PostSend(sendContext);
-
     return true;
 }
 
 void ServerSession::PostSend(IOContext* sendContext)
 {
+    if (IsDisconnected()) {
+        g_ioContextPool.Deallocate(sendContext);
+        return;
+    }
+
     DWORD sendBytes = 0;
     DWORD flags = 0;
 
-    // 비동기 전송 시작
     if (WSASend(m_sock, &sendContext->wsaBuf, 1, &sendBytes, flags, &sendContext->overlapped, NULL) == SOCKET_ERROR)
     {
         if (WSAGetLastError() != WSA_IO_PENDING)
         {
-            std::cerr << "WSASend Failed: " << WSAGetLastError() << std::endl;
+            LOG_ERROR("WSASend failed: " << WSAGetLastError());
             g_ioContextPool.Deallocate(sendContext);
             Disconnect();
         }
     }
+    // 성공/WSA_IO_PENDING이면 sendContext는 완료 통지가 올 때까지 살아 있고,
+    // 그 안의 shared_ptr<ServerSession>이 세션을 붙잡아 둡니다.
 }

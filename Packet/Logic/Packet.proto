@@ -20,3 +20,57 @@ message S_LOGIN {
 message C_CHAT {
     string message = 1;
 }
+
+// S_CHAT 메시지 정의 (서버 -> 룸 브로드캐스트)
+message S_CHAT {
+    string sender = 1;
+    string message = 2;
+}
+
+// C_ROOM_ENTER: 클라이언트가 특정 게임룸 입장을 요청
+message C_ROOM_ENTER {
+    string room_name = 1;
+}
+
+// S_ROOM_ENTER: 입장 요청에 대한 응답 (본인에게만)
+message S_ROOM_ENTER {
+    bool success = 1;
+    string message = 2;
+    string room_name = 3;
+}
+
+// C_ROOM_LEAVE: 클라이언트가 현재 룸 퇴장을 요청
+message C_ROOM_LEAVE {
+}
+
+// S_ROOM_LEAVE: 퇴장 요청에 대한 응답 (본인에게만)
+message S_ROOM_LEAVE {
+    bool success = 1;
+}
+
+// S_ROOM_USER_ENTERED: 같은 룸의 다른 유저들에게 브로드캐스트
+message S_ROOM_USER_ENTERED {
+    string account_id = 1;
+}
+
+// S_ROOM_USER_LEFT: 같은 룸의 다른 유저들에게 브로드캐스트
+message S_ROOM_USER_LEFT {
+    string account_id = 1;
+}
+
+// C_MOVE: 클라이언트가 보내는 이동 입력 (룸에 입장한 상태에서만 유효)
+message C_MOVE {
+    float x = 1;
+    float y = 2;
+}
+
+// S_MOVE_BROADCAST: 룸의 틱(Tick)마다 누적된 이동을 모아 룸 전체에 브로드캐스트
+message MovedActor {
+    string account_id = 1;
+    float x = 2;
+    float y = 3;
+}
+
+message S_MOVE_BROADCAST {
+    repeated MovedActor actors = 1;
+}

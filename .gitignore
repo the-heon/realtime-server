@@ -41,3 +41,6 @@
 *.dwo
 
 .vscode/
+
+# CMake out-of-source build directory
+/build/

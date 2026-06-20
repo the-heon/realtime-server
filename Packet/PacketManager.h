@@ -1,32 +1,27 @@
-  
-#include "Core/ServerCore.h"
+#pragma once
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
 
-// <functional>, <map>, "ServerCore.h" 등은 pch.h에 포함되므로 #include 하지 않습니다.
-// ServerSession 클래스는 ServerCore.h에 정의되어 있으며, pch.h를 통해 인식됩니다.
+class ServerSession;
 
-// PacketHandlerFunc: 패킷 처리 함수의 시그니처 정의
-// (ServerSession*, Protobuf 본문 데이터 포인터, 본문 크기)를 전달받음
-// std::function은 pch.h를 통해 인식됩니다.
-using PacketHandlerFunc = std::function<void(ServerSession*, char*, int)>; 
+// 패킷 처리 함수의 시그니처.
+// shared_ptr로 받는 이유: 핸들러가 GameRoom::PushJob처럼 처리를 나중으로
+// 미루는 경우, 그 람다가 세션을 shared_ptr로 캡처해서 안전하게 들고 있어야 합니다.
+using PacketHandlerFunc = std::function<void(const std::shared_ptr<ServerSession>&, char*, int)>;
 
 class PacketManager
 {
 public:
-    PacketManager();
+    PacketManager() = default;
 
     // 특정 PacketID에 대한 처리 함수(핸들러)를 등록
     void RegisterHandler(uint16_t packetId, PacketHandlerFunc handler);
 
     // 분리된 패킷을 받아 ID에 따라 핸들러를 호출하는 Dispatcher 역할
-    void HandlePacket(ServerSession* ServerSession, char* packetData, int size); 
+    void HandlePacket(const std::shared_ptr<ServerSession>& session, char* packetData, int size);
 
 private:
-    std::map<uint16_t, PacketHandlerFunc> m_handlers; // std::map은 pch.h를 통해 인식됩니다.
+    std::map<uint16_t, PacketHandlerFunc> m_handlers;
 };
-
-// ==========================================================
-// 예시: 실제 패킷 처리 함수 선언 (Logic Layer에서 구현)
-// ==========================================================
-// 이 함수들은 Logic Layer의 .cpp 파일에 구현되며, 그 파일에서 "Packet.pb.h"를 include 합니다.
-void Handle_C_LOGIN(ServerSession* ServerSession, char* payload, int payloadSize);
-void Handle_C_CHAT(ServerSession* ServerSession, char* payload, int payloadSize);
