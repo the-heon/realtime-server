@@ -1,4 +1,5 @@
 #include "RoomManager.h"
+#include "../Utils/Config.h"
 #include <vector>
 
 RoomManager& RoomManager::Instance()
@@ -11,10 +12,10 @@ GameRoom* RoomManager::GetOrCreate(const std::string& name)
 {
     std::lock_guard<std::mutex> lock(m_lock);
     auto it = m_rooms.find(name);
-    if (it != m_rooms.end()) {
-        return it->second.get();
-    }
-    auto room = std::make_unique<GameRoom>(name);
+    if (it != m_rooms.end()) return it->second.get();
+
+    int maxPlayers = Config::Instance().Get().maxRoomPlayers;
+    auto room = std::make_unique<GameRoom>(name, maxPlayers);
     GameRoom* raw = room.get();
     m_rooms.emplace(name, std::move(room));
     return raw;
@@ -37,9 +38,18 @@ void RoomManager::TickAll()
             rooms.push_back(room.get());
         }
     }
-    // 락을 들고 있지 않은 상태에서 Tick() 호출 - GetOrCreate()가 그 사이 다른
-    // 룸을 추가해도 막히지 않습니다.
-    for (GameRoom* room : rooms) {
-        room->Tick();
+    for (GameRoom* room : rooms) room->Tick();
+}
+
+std::vector<RoomInfo> RoomManager::GetRoomInfoList() const
+{
+    std::lock_guard<std::mutex> lock(m_lock);
+    std::vector<RoomInfo> list;
+    list.reserve(m_rooms.size());
+    for (const auto& [name, room] : m_rooms) {
+        list.push_back({ name,
+                         static_cast<int>(room->MemberCount()),
+                         room->GetMaxPlayers() });
     }
+    return list;
 }
