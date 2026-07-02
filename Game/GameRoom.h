@@ -5,11 +5,20 @@
 #include <unordered_map>
 #include <vector>
 #include <utility>
+#include <chrono>
 #include "../Utils/JobQueue.h"
+#include "../Utils/Logger.h"
 #include "../Core/ServerSession.h"
 #include "../Packet/PacketID.h"
 #include "../Packet/PacketHeader.h"
 #include "../Packet/Logic/Packet.pb.h"
+
+enum class RoomState : uint8_t
+{
+    WAITING  = 0,  // 대기실 - 입장/레디 가능
+    IN_GAME  = 1,  // 게임 진행 중
+    FINISHED = 2,  // 결과 표시 (5초 후 자동 WAITING 전환)
+};
 
 // 하나의 "게임 룸" = 참가자 목록 + 매 틱 처리할 Job 큐 + 틱마다 보내는 상태 브로드캐스트.
 //
@@ -26,17 +35,35 @@ public:
     const std::string& GetName()       const { return m_name; }
     int                GetMaxPlayers() const { return m_maxPlayers; }
     size_t             MemberCount()   const { return m_members.size(); }
+    RoomState          GetState()      const { return m_state; }
 
     void PushJob(Job job) { m_jobQueue.Push(std::move(job)); }
 
     void Tick()
     {
         m_jobQueue.Flush();
+
+        if (m_state == RoomState::FINISHED) {
+            if (NowMs() - m_finishedAt > 5000) {
+                m_state = RoomState::WAITING;
+                BroadcastRoomState();
+                LOG_INFO("[Room:" << m_name << "] reset to WAITING");
+            }
+            return;
+        }
+
         BroadcastPendingMoves();
     }
 
     void HandleEnter(const std::shared_ptr<ServerSession>& session)
     {
+        if (m_state == RoomState::IN_GAME) {
+            Protocol::S_ROOM_ENTER ack;
+            ack.set_success(false);
+            ack.set_message("게임이 진행 중입니다.");
+            session->Send(ack);
+            return;
+        }
         if (static_cast<int>(m_members.size()) >= m_maxPlayers) {
             Protocol::S_ROOM_ENTER ack;
             ack.set_success(false);
@@ -57,6 +84,8 @@ public:
         Protocol::S_ROOM_USER_ENTERED notice;
         notice.set_account_id(session->GetAccountId());
         BroadcastExcept(notice, session);
+
+        BroadcastRoomState();
     }
 
     void HandleLeave(const std::shared_ptr<ServerSession>& session)
@@ -64,18 +93,43 @@ public:
         if (m_members.erase(session) == 0) return;
         session->SetRoom(nullptr);
         m_pendingMoves.erase(session->GetAccountId());
+        m_readyPlayers.erase(session->GetAccountId());
 
         Protocol::S_ROOM_USER_LEFT notice;
         notice.set_account_id(session->GetAccountId());
-        BroadcastExcept(notice, session);
+        Broadcast(notice);
+
+        // IN_GAME 도중 이탈 → 남은 플레이어가 자동 승리
+        if (m_state == RoomState::IN_GAME && !m_members.empty()) {
+            HandleGameEnd((*m_members.begin())->GetAccountId());
+            return;
+        }
+
+        BroadcastRoomState();
     }
 
     void HandleMove(const std::string& accountId, float x, float y)
     {
+        if (m_state != RoomState::IN_GAME) return;
         m_pendingMoves[accountId] = { x, y };
     }
 
-    // 단일 수신자 또는 소규모 전송: 메시지를 각 세션마다 개별 직렬화
+    // C_READY 수신 시 호출 - ready 상태 토글
+    void HandleReady(const std::string& accountId)
+    {
+        if (m_state != RoomState::WAITING) return;
+
+        if (m_readyPlayers.count(accountId)) {
+            m_readyPlayers.erase(accountId);
+        } else {
+            m_readyPlayers.insert(accountId);
+        }
+
+        BroadcastRoomState();
+        TryStartGame();
+    }
+
+    // 단일 수신자 또는 소규모 전송
     template<typename T>
     void Broadcast(const T& message)
     {
@@ -92,8 +146,7 @@ public:
         }
     }
 
-    // 브로드캐스트 최적화: 메시지를 한 번만 직렬화하고 공유 버퍼를 N개 세션에 전달.
-    // 틱마다 호출되는 S_MOVE_BROADCAST처럼 모든 멤버에게 동일한 내용을 보낼 때 사용.
+    // 브로드캐스트 최적화: 메시지를 한 번만 직렬화하고 공유 버퍼를 N개 세션에 전달
     template<typename T>
     void BroadcastShared(const T& message)
     {
@@ -113,7 +166,70 @@ public:
         }
     }
 
+    // Raw 바이너리 브로드캐스트 (Ping/RoomState/GameStart/GameResult 등)
+    void SendRawBroadcast(uint16_t packetId, const void* data, int dataSize)
+    {
+        for (const auto& session : m_members) {
+            session->SendRaw(packetId, data, dataSize);
+        }
+    }
+
 private:
+    static int64_t NowMs()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // 모든 플레이어가 레디이고 최소 2명 이상이면 게임 시작
+    void TryStartGame()
+    {
+        if (m_members.size() < 2) return;
+        if (m_readyPlayers.size() < m_members.size()) return;
+
+        m_state = RoomState::IN_GAME;
+        m_readyPlayers.clear();
+
+        SendRawBroadcast(static_cast<uint16_t>(PacketID::S_GAME_START), nullptr, 0);
+        BroadcastRoomState();
+
+        LOG_INFO("[Room:" << m_name << "] game started (" << m_members.size() << " players)");
+    }
+
+    void HandleGameEnd(const std::string& winnerId)
+    {
+        m_state      = RoomState::FINISHED;
+        m_finishedAt = NowMs();
+
+        // S_GAME_RESULT: [uint16 winnerLen][char* winnerId]
+        std::vector<uint8_t> data;
+        auto nameLen = static_cast<uint16_t>(winnerId.size());
+        data.push_back(nameLen & 0xFF);
+        data.push_back((nameLen >> 8) & 0xFF);
+        for (char c : winnerId) data.push_back(static_cast<uint8_t>(c));
+
+        SendRawBroadcast(static_cast<uint16_t>(PacketID::S_GAME_RESULT),
+                         data.data(), static_cast<int>(data.size()));
+        BroadcastRoomState();
+
+        LOG_INFO("[Room:" << m_name << "] game ended, winner: " << winnerId);
+    }
+
+    // S_ROOM_STATE: [uint8 state][uint16 totalPlayers][uint16 readyCount]
+    void BroadcastRoomState()
+    {
+        if (m_members.empty()) return;
+
+        uint8_t data[5];
+        data[0] = static_cast<uint8_t>(m_state);
+        auto total = static_cast<uint16_t>(m_members.size());
+        auto ready = static_cast<uint16_t>(m_readyPlayers.size());
+        data[1] = total & 0xFF;  data[2] = (total >> 8) & 0xFF;
+        data[3] = ready & 0xFF;  data[4] = (ready >> 8) & 0xFF;
+
+        SendRawBroadcast(static_cast<uint16_t>(PacketID::S_ROOM_STATE), data, sizeof(data));
+    }
+
     void BroadcastPendingMoves()
     {
         if (m_pendingMoves.empty()) return;
@@ -127,13 +243,17 @@ private:
         }
         m_pendingMoves.clear();
 
-        BroadcastShared(snapshot); // 한 번만 직렬화
+        BroadcastShared(snapshot);
     }
 
     std::string m_name;
     int         m_maxPlayers;
     JobQueue    m_jobQueue;
 
-    std::unordered_set<std::shared_ptr<ServerSession>>              m_members;      // 틱 스레드 전용
-    std::unordered_map<std::string, std::pair<float, float>>        m_pendingMoves; // 틱 스레드 전용
+    RoomState m_state      = RoomState::WAITING;
+    int64_t   m_finishedAt = 0;
+
+    std::unordered_set<std::string>                                    m_readyPlayers; // 틱 스레드 전용
+    std::unordered_set<std::shared_ptr<ServerSession>>                 m_members;      // 틱 스레드 전용
+    std::unordered_map<std::string, std::pair<float, float>>           m_pendingMoves; // 틱 스레드 전용
 };

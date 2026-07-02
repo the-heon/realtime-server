@@ -11,6 +11,7 @@ struct RoomInfo
     std::string name;
     int         playerCount;
     int         maxPlayers;
+    RoomState   state;
 };
 
 // 이름으로 룸을 찾거나 없으면 만들어주는 레지스트리.

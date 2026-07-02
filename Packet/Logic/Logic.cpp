@@ -171,9 +171,9 @@ void Handle_C_ROOM_LIST(const std::shared_ptr<ServerSession>& session, char* /*p
     auto rooms = RoomManager::Instance().GetRoomInfoList();
 
     // S_ROOM_LIST 바이너리 포맷 직렬화
-    // [uint16 count] { [uint16 nameLen][name bytes][uint16 playerCount][uint16 maxPlayers] }...
+    // [uint16 count] { [uint16 nameLen][name bytes][uint16 playerCount][uint16 maxPlayers][uint8 state] }...
     std::vector<uint8_t> data;
-    data.reserve(2 + rooms.size() * 24);
+    data.reserve(2 + rooms.size() * 26);
 
     auto writeU16 = [&](uint16_t v) {
         data.push_back(static_cast<uint8_t>(v & 0xFF));
@@ -186,10 +186,30 @@ void Handle_C_ROOM_LIST(const std::shared_ptr<ServerSession>& session, char* /*p
         for (char c : r.name) data.push_back(static_cast<uint8_t>(c));
         writeU16(static_cast<uint16_t>(r.playerCount));
         writeU16(static_cast<uint16_t>(r.maxPlayers));
+        data.push_back(static_cast<uint8_t>(r.state));
     }
 
     session->SendRaw(static_cast<uint16_t>(PacketID::S_ROOM_LIST),
                      data.data(), static_cast<int>(data.size()));
+}
+
+void Handle_C_READY(const std::shared_ptr<ServerSession>& session, char* /*payload*/, int /*payloadSize*/)
+{
+    if (session->GetAccountId().empty()) {
+        LOG_WARN("Handle_C_READY: 로그인 없이 ready 시도, sessionId=" << session->GetSessionId());
+        return;
+    }
+
+    GameRoom* room = session->GetRoom();
+    if (room == nullptr) {
+        LOG_WARN("Handle_C_READY: " << session->GetAccountId() << " is not in a room");
+        return;
+    }
+
+    std::string accountId = session->GetAccountId();
+    room->PushJob([room, accountId]() {
+        room->HandleReady(accountId);
+    });
 }
 
 void RegisterHandlers(PacketManager& pm)
@@ -201,6 +221,7 @@ void RegisterHandlers(PacketManager& pm)
     pm.RegisterHandler(static_cast<uint16_t>(PacketID::C_MOVE),      Handle_C_MOVE);
     pm.RegisterHandler(static_cast<uint16_t>(PacketID::C_PING),      Handle_C_PING);
     pm.RegisterHandler(static_cast<uint16_t>(PacketID::C_ROOM_LIST), Handle_C_ROOM_LIST);
+    pm.RegisterHandler(static_cast<uint16_t>(PacketID::C_READY),     Handle_C_READY);
 }
 
 } // namespace GameLogic
