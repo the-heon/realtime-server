@@ -49,7 +49,8 @@ std::vector<RoomInfo> RoomManager::GetRoomInfoList() const
     for (const auto& [name, room] : m_rooms) {
         list.push_back({ name,
                          static_cast<int>(room->MemberCount()),
-                         room->GetMaxPlayers() });
+                         room->GetMaxPlayers(),
+                         room->GetState() });
     }
     return list;
 }

@@ -32,6 +32,19 @@ enum class PacketID : uint16_t
     //   per room: [uint16 nameLen][char* name][uint16 playerCount][uint16 maxPlayers]
     C_ROOM_LIST        = 15,
     S_ROOM_LIST        = 16,
+
+    // --- 게임 상태 머신 패킷 ---
+    // C_READY payload: 없음 (ready 토글)
+    // S_ROOM_STATE payload: [uint8 state][uint16 totalPlayers][uint16 readyCount]
+    //   state: 0=WAITING, 1=IN_GAME, 2=FINISHED
+    C_READY            = 17,
+    S_ROOM_STATE       = 18,
+
+    // S_GAME_START payload: 없음 (모든 플레이어 준비 완료 → 게임 시작 신호)
+    S_GAME_START       = 19,
+
+    // S_GAME_RESULT payload: [uint16 winnerLen][char* winnerId]
+    S_GAME_RESULT      = 20,
 };
 
 // Protobuf 메시지 타입 <-> PacketID 매핑 (ServerSession::Send<T>() 에서 사용)
