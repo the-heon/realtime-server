@@ -23,6 +23,7 @@ set(SERVER_SOURCES
     Game/RoomManager.cpp
     Utils/HttpClient.cpp
     Utils/AuthService.cpp
+    Utils/HealthServer.cpp
 )
 
 add_executable(realtime-server ${SERVER_SOURCES})

@@ -50,9 +50,21 @@ void Handle_C_LOGIN(const std::shared_ptr<ServerSession>& session, char* payload
 
             if (valid) {
                 session->SetAccountId(accountId);
-                res.set_message("Login OK.");
+
+                // 게임 중 재접속 확인
+                GameRoom* reconnectRoom = RoomManager::Instance().FindReconnect(accountId);
+                if (reconnectRoom != nullptr) {
+                    reconnectRoom->PushJob([reconnectRoom, session]() {
+                        reconnectRoom->HandleRejoin(session);
+                    });
+                    res.set_message("reconnected");
+                } else {
+                    res.set_message("Login OK.");
+                }
+
                 LOG_INFO("Login success: accountId=" << accountId
-                         << " sessionId=" << session->GetSessionId());
+                         << " sessionId=" << session->GetSessionId()
+                         << (reconnectRoom ? " [reconnect]" : ""));
             } else {
                 res.set_message("유효하지 않은 session_token입니다.");
                 LOG_WARN("Login failed: invalid token, sessionId=" << session->GetSessionId());

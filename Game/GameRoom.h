@@ -36,12 +36,31 @@ public:
     int                GetMaxPlayers() const { return m_maxPlayers; }
     size_t             MemberCount()   const { return m_members.size(); }
     RoomState          GetState()      const { return m_state; }
+    int64_t            EmptySinceMs()  const { return m_emptySinceMs.load(std::memory_order_relaxed); }
+
+    // 재접속 슬롯 조회 (RoomManager에서 호출)
+    bool HasPendingReconnect(const std::string& accountId) const
+    {
+        return m_pendingReconnects.count(accountId) > 0;
+    }
 
     void PushJob(Job job) { m_jobQueue.Push(std::move(job)); }
 
-    void Tick()
+    void Tick(int reconnectWindowMs = 30000)
     {
         m_jobQueue.Flush();
+
+        // 만료된 재접속 슬롯 정리
+        if (!m_pendingReconnects.empty()) {
+            int64_t now = NowMs();
+            for (auto it = m_pendingReconnects.begin(); it != m_pendingReconnects.end(); ) {
+                if (now - it->second.storedAt > reconnectWindowMs) {
+                    it = m_pendingReconnects.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
 
         if (m_state == RoomState::FINISHED) {
             if (NowMs() - m_finishedAt > 5000) {
@@ -73,6 +92,7 @@ public:
         }
 
         m_members.insert(session);
+        m_emptySinceMs.store(0, std::memory_order_relaxed);
         session->SetRoom(this);
 
         Protocol::S_ROOM_ENTER ack;
@@ -99,10 +119,17 @@ public:
         notice.set_account_id(session->GetAccountId());
         Broadcast(notice);
 
-        // IN_GAME 도중 이탈 → 남은 플레이어가 자동 승리
-        if (m_state == RoomState::IN_GAME && !m_members.empty()) {
-            HandleGameEnd((*m_members.begin())->GetAccountId());
-            return;
+        // IN_GAME 도중 이탈 → 재접속 슬롯 저장 후 나머지가 승리
+        if (m_state == RoomState::IN_GAME) {
+            m_pendingReconnects[session->GetAccountId()] = { NowMs() };
+            if (!m_members.empty()) {
+                HandleGameEnd((*m_members.begin())->GetAccountId());
+                return;
+            }
+        }
+
+        if (m_members.empty()) {
+            m_emptySinceMs.store(NowMs(), std::memory_order_relaxed);
         }
 
         BroadcastRoomState();
@@ -112,6 +139,28 @@ public:
     {
         if (m_state != RoomState::IN_GAME) return;
         m_pendingMoves[accountId] = { x, y };
+    }
+
+    // 게임 중 재접속 처리 (상태 확인 없이 즉시 복귀)
+    void HandleRejoin(const std::shared_ptr<ServerSession>& session)
+    {
+        m_pendingReconnects.erase(session->GetAccountId());
+        m_members.insert(session);
+        m_emptySinceMs.store(0, std::memory_order_relaxed);
+        session->SetRoom(this);
+
+        Protocol::S_ROOM_ENTER ack;
+        ack.set_success(true);
+        ack.set_message("reconnected");
+        ack.set_room_name(m_name);
+        session->Send(ack);
+
+        Protocol::S_ROOM_USER_ENTERED notice;
+        notice.set_account_id(session->GetAccountId());
+        BroadcastExcept(notice, session);
+
+        BroadcastRoomState();
+        LOG_INFO("[Room:" << m_name << "] " << session->GetAccountId() << " reconnected");
     }
 
     // C_READY 수신 시 호출 - ready 상태 토글
@@ -246,14 +295,18 @@ private:
         BroadcastShared(snapshot);
     }
 
+    struct ReconnectSlot { int64_t storedAt; };
+
     std::string m_name;
     int         m_maxPlayers;
     JobQueue    m_jobQueue;
 
-    RoomState m_state      = RoomState::WAITING;
-    int64_t   m_finishedAt = 0;
+    RoomState m_state        = RoomState::WAITING;
+    int64_t   m_finishedAt   = 0;
+    std::atomic<int64_t> m_emptySinceMs{ 0 }; // 마지막으로 룸이 빈 시각
 
-    std::unordered_set<std::string>                                    m_readyPlayers; // 틱 스레드 전용
-    std::unordered_set<std::shared_ptr<ServerSession>>                 m_members;      // 틱 스레드 전용
-    std::unordered_map<std::string, std::pair<float, float>>           m_pendingMoves; // 틱 스레드 전용
+    std::unordered_set<std::string>                                    m_readyPlayers;      // 틱 스레드 전용
+    std::unordered_set<std::shared_ptr<ServerSession>>                 m_members;           // 틱 스레드 전용
+    std::unordered_map<std::string, std::pair<float, float>>           m_pendingMoves;      // 틱 스레드 전용
+    std::unordered_map<std::string, ReconnectSlot>                     m_pendingReconnects; // 틱 스레드 전용
 };

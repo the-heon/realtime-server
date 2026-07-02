@@ -20,6 +20,14 @@ public:
     static Response Get(const std::string& host, int port,
                         const std::string& path, int timeoutMs = 3000);
 
+    // 동기 POST 요청 (Content-Type: application/json). 실패 시 statusCode=0 반환.
+    static Response Post(const std::string& host, int port,
+                         const std::string& path, const std::string& body,
+                         int timeoutMs = 3000);
+
 private:
     static std::wstring ToWide(const std::string& s);
+    static Response DoRequest(const std::string& method, const std::string& host,
+                              int port, const std::string& path,
+                              const std::string& body, int timeoutMs);
 };

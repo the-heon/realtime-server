@@ -28,7 +28,7 @@ GameRoom* RoomManager::Find(const std::string& name)
     return it != m_rooms.end() ? it->second.get() : nullptr;
 }
 
-void RoomManager::TickAll()
+void RoomManager::TickAll(int reconnectWindowMs)
 {
     std::vector<GameRoom*> rooms;
     {
@@ -38,7 +38,38 @@ void RoomManager::TickAll()
             rooms.push_back(room.get());
         }
     }
-    for (GameRoom* room : rooms) room->Tick();
+    for (GameRoom* room : rooms) room->Tick(reconnectWindowMs);
+}
+
+int RoomManager::RemoveIdleRooms(int64_t idleMs)
+{
+    std::lock_guard<std::mutex> lock(m_lock);
+    int removed = 0;
+    using namespace std::chrono;
+    int64_t now = duration_cast<milliseconds>(
+        steady_clock::now().time_since_epoch()).count();
+
+    for (auto it = m_rooms.begin(); it != m_rooms.end(); ) {
+        int64_t emptySince = it->second->EmptySinceMs();
+        if (emptySince > 0 && (now - emptySince) > idleMs) {
+            it = m_rooms.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+    return removed;
+}
+
+GameRoom* RoomManager::FindReconnect(const std::string& accountId)
+{
+    std::lock_guard<std::mutex> lock(m_lock);
+    for (auto& [name, room] : m_rooms) {
+        if (room->HasPendingReconnect(accountId)) {
+            return room.get();
+        }
+    }
+    return nullptr;
 }
 
 std::vector<RoomInfo> RoomManager::GetRoomInfoList() const
