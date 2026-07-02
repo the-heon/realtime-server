@@ -34,3 +34,14 @@ size_t SessionManager::Count() const
     std::lock_guard<std::mutex> lock(m_lock);
     return m_sessions.size();
 }
+
+std::vector<std::shared_ptr<ServerSession>> SessionManager::GetAll() const
+{
+    std::lock_guard<std::mutex> lock(m_lock);
+    std::vector<std::shared_ptr<ServerSession>> result;
+    result.reserve(m_sessions.size());
+    for (const auto& [id, session] : m_sessions) {
+        result.push_back(session);
+    }
+    return result;
+}

@@ -1,13 +1,20 @@
 #pragma once
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <memory>
 #include <mutex>
 #include "GameRoom.h"
 
+struct RoomInfo
+{
+    std::string name;
+    int         playerCount;
+    int         maxPlayers;
+};
+
 // 이름으로 룸을 찾거나 없으면 만들어주는 레지스트리.
-// 모든 룸의 Tick()을 한 스레드에서 순서대로 돌리는 TickAll()도 여기서 제공합니다 -
-// "룸 상태는 틱 스레드 하나만 건드린다"는 전제를 룸이 여러 개여도 유지하기 위함입니다.
+// 모든 룸의 Tick()을 한 스레드에서 순서대로 돌리는 TickAll()도 여기서 제공합니다.
 class RoomManager
 {
 public:
@@ -18,9 +25,12 @@ public:
 
     void TickAll();
 
+    // 현재 존재하는 모든 룸의 정보 스냅샷 (C_ROOM_LIST 응답용)
+    std::vector<RoomInfo> GetRoomInfoList() const;
+
 private:
     RoomManager() = default;
 
-    std::mutex m_lock;
+    mutable std::mutex m_lock;
     std::unordered_map<std::string, std::unique_ptr<GameRoom>> m_rooms;
 };

@@ -2,8 +2,10 @@
 #include <cstring>
 #include "google/protobuf/message.h"
 #include "../Utils/Logger.h"
+#include "../Utils/ServerStats.h"
 
 // IOContext 구현
+
 IOContext::IOContext(EIOType type, std::shared_ptr<ServerSession> owner)
     : ioType(type), session(std::move(owner))
 {
@@ -13,13 +15,15 @@ IOContext::IOContext(EIOType type, std::shared_ptr<ServerSession> owner)
 void IOContext::Reset(EIOType type, std::shared_ptr<ServerSession> owner)
 {
     std::memset(&overlapped, 0, sizeof(OVERLAPPED));
-    ioType = type;
-    session = std::move(owner);
-    wsaBuf = {};
-    acceptSocket = INVALID_SOCKET;
+    ioType        = type;
+    session       = std::move(owner);
+    wsaBuf        = {};
+    acceptSocket  = INVALID_SOCKET;
+    sharedBuffer.reset(); // 이전에 공유 버퍼를 들고 있었다면 레퍼런스 해제
 }
 
 // ServerSession 구현
+
 ServerSession::ServerSession() = default;
 
 ServerSession::~ServerSession()
@@ -31,8 +35,8 @@ void ServerSession::Init(SOCKET socket, const sockaddr_in& addr)
 {
     m_sock = socket;
     m_addr = addr;
-    // shared_from_this()는 이 세션이 이미 shared_ptr로 소유되고 있어야 호출할 수
-    // 있으므로(make_shared 직후), 생성자가 아니라 여기서 recv context를 만듭니다.
+    UpdateActivity(); // 연결 직후부터 타임아웃 카운트 시작
+    // shared_from_this()는 make_shared 이후에만 유효하므로 생성자가 아닌 여기서 생성
     m_recvContext = new IOContext(EIOType::RECV, shared_from_this());
 }
 
@@ -48,56 +52,100 @@ bool ServerSession::Disconnect()
 
 bool ServerSession::SendInternal(uint16_t packetId, const google::protobuf::Message& message)
 {
-    if (IsDisconnected()) {
-        return false;
-    }
+    if (IsDisconnected()) return false;
 
     int payloadSize = static_cast<int>(message.ByteSizeLong());
-    int totalSize = static_cast<int>(sizeof(PacketHeader)) + payloadSize;
+    int totalSize   = static_cast<int>(sizeof(PacketHeader)) + payloadSize;
 
     if (totalSize > IOContext::MAX_BUF_SIZE) {
         LOG_ERROR("Send: packet too large (" << totalSize << " bytes), packetId=" << packetId);
         return false;
     }
 
-    IOContext* sendContext = g_ioContextPool.Allocate(EIOType::SEND, shared_from_this());
+    IOContext* ctx = g_ioContextPool.Allocate(EIOType::SEND, shared_from_this());
 
-    // [PacketHeader][Protobuf 직렬화 데이터] 형태로 버퍼를 채웁니다.
-    PacketHeader* header = reinterpret_cast<PacketHeader*>(sendContext->buffer);
-    header->packetSize = static_cast<uint16_t>(payloadSize);
-    header->packetId = packetId;
+    PacketHeader* header = reinterpret_cast<PacketHeader*>(ctx->buffer);
+    header->packetSize   = static_cast<uint16_t>(payloadSize);
+    header->packetId     = packetId;
 
-    if (!message.SerializeToArray(sendContext->buffer + sizeof(PacketHeader), payloadSize)) {
-        g_ioContextPool.Deallocate(sendContext);
+    if (!message.SerializeToArray(ctx->buffer + sizeof(PacketHeader), payloadSize)) {
+        g_ioContextPool.Deallocate(ctx);
         return false;
     }
 
-    sendContext->wsaBuf.buf = sendContext->buffer;
-    sendContext->wsaBuf.len = totalSize;
+    ctx->wsaBuf.buf = ctx->buffer;
+    ctx->wsaBuf.len = static_cast<ULONG>(totalSize);
 
-    PostSend(sendContext);
+    STATS_ADD(totalBytesSent, static_cast<uint64_t>(totalSize));
+    STATS_INC(totalPacketsSent);
+
+    PostSend(ctx);
     return true;
 }
 
-void ServerSession::PostSend(IOContext* sendContext)
+bool ServerSession::SendShared(std::shared_ptr<std::vector<char>> packet)
+{
+    if (IsDisconnected()) return false;
+
+    IOContext* ctx      = g_ioContextPool.Allocate(EIOType::SEND, shared_from_this());
+    ctx->sharedBuffer   = packet; // keep-alive
+    ctx->wsaBuf.buf     = packet->data();
+    ctx->wsaBuf.len     = static_cast<ULONG>(packet->size());
+
+    STATS_ADD(totalBytesSent, static_cast<uint64_t>(packet->size()));
+    STATS_INC(totalPacketsSent);
+
+    PostSend(ctx);
+    return true;
+}
+
+bool ServerSession::SendRaw(uint16_t packetId, const void* data, int dataSize)
+{
+    if (IsDisconnected()) return false;
+
+    int totalSize = static_cast<int>(sizeof(PacketHeader)) + dataSize;
+    if (totalSize > IOContext::MAX_BUF_SIZE) {
+        LOG_ERROR("SendRaw: packet too large (" << totalSize << " bytes), packetId=" << packetId);
+        return false;
+    }
+
+    IOContext* ctx = g_ioContextPool.Allocate(EIOType::SEND, shared_from_this());
+
+    PacketHeader* header = reinterpret_cast<PacketHeader*>(ctx->buffer);
+    header->packetSize   = static_cast<uint16_t>(dataSize);
+    header->packetId     = packetId;
+
+    if (dataSize > 0 && data != nullptr) {
+        std::memcpy(ctx->buffer + sizeof(PacketHeader), data, dataSize);
+    }
+
+    ctx->wsaBuf.buf = ctx->buffer;
+    ctx->wsaBuf.len = static_cast<ULONG>(totalSize);
+
+    STATS_ADD(totalBytesSent, static_cast<uint64_t>(totalSize));
+    STATS_INC(totalPacketsSent);
+
+    PostSend(ctx);
+    return true;
+}
+
+void ServerSession::PostSend(IOContext* ctx)
 {
     if (IsDisconnected()) {
-        g_ioContextPool.Deallocate(sendContext);
+        g_ioContextPool.Deallocate(ctx);
         return;
     }
 
     DWORD sendBytes = 0;
-    DWORD flags = 0;
+    DWORD flags     = 0;
 
-    if (WSASend(m_sock, &sendContext->wsaBuf, 1, &sendBytes, flags, &sendContext->overlapped, NULL) == SOCKET_ERROR)
+    if (WSASend(m_sock, &ctx->wsaBuf, 1, &sendBytes, flags, &ctx->overlapped, NULL) == SOCKET_ERROR)
     {
         if (WSAGetLastError() != WSA_IO_PENDING)
         {
             LOG_ERROR("WSASend failed: " << WSAGetLastError());
-            g_ioContextPool.Deallocate(sendContext);
+            g_ioContextPool.Deallocate(ctx);
             Disconnect();
         }
     }
-    // 성공/WSA_IO_PENDING이면 sendContext는 완료 통지가 올 때까지 살아 있고,
-    // 그 안의 shared_ptr<ServerSession>이 세션을 붙잡아 둡니다.
 }
