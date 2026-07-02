@@ -3,11 +3,12 @@
 #include "../Game/RoomManager.h"
 #include "../Packet/Logic/Logic.h"
 #include "../Utils/Logger.h"
+#include "../Utils/Config.h"
+#include "../Utils/ServerStats.h"
+#include "../Utils/AuthService.h"
 #include <ws2tcpip.h>
 #include <cstring>
 
-// IOContext들을 재사용하는 전역 풀. 주로 SEND에 쓰입니다 (RECV는 세션당 1개를
-// 세션 자신이 들고 있고, ACCEPT는 빈도가 낮아 그냥 new/delete 합니다).
 ObjectPool<IOContext> g_ioContextPool;
 
 ServerCore::ServerCore() = default;
@@ -15,18 +16,21 @@ ServerCore::ServerCore() = default;
 ServerCore::~ServerCore()
 {
     Stop();
-    if (m_listenSocket != INVALID_SOCKET) {
-        closesocket(m_listenSocket);
-    }
-    if (m_hIOCP != INVALID_HANDLE_VALUE) {
-        CloseHandle(m_hIOCP);
-    }
+    if (m_listenSocket != INVALID_SOCKET) closesocket(m_listenSocket);
+    if (m_hIOCP != INVALID_HANDLE_VALUE) CloseHandle(m_hIOCP);
     WSACleanup();
+    AuthService::Instance().Stop();
+    Logger::Instance().Shutdown();
 }
 
 bool ServerCore::Init(int port)
 {
     m_port = port;
+
+    const auto& cfg = Config::Instance().Get();
+    if (!cfg.logFile.empty()) {
+        Logger::Instance().SetLogFile(cfg.logFile);
+    }
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -44,9 +48,9 @@ bool ServerCore::Init(int port)
     setsockopt(m_listenSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
 
     sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
+    addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(static_cast<u_short>(port));
+    addr.sin_port        = htons(static_cast<u_short>(port));
 
     if (bind(m_listenSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
         LOG_ERROR("bind failed: " << WSAGetLastError());
@@ -69,8 +73,6 @@ bool ServerCore::Init(int port)
         return false;
     }
 
-    // AcceptEx는 일반 API가 아니라 WSAIoctl로 함수 포인터를 받아와야 하는
-    // Winsock 확장 함수입니다.
     GUID guidAcceptEx = WSAID_ACCEPTEX;
     DWORD bytes = 0;
     if (WSAIoctl(m_listenSocket, SIO_GET_EXTENSION_FUNCTION_POINTER,
@@ -83,7 +85,11 @@ bool ServerCore::Init(int port)
 
     GameLogic::RegisterHandlers(m_packetManager);
 
-    LOG_INFO("ServerCore initialized on port " << port);
+    // AuthService 시작 (session-server 토큰 검증 전용 스레드 풀)
+    AuthService::Instance().Start(cfg.authWorkerCount);
+
+    LOG_INFO("ServerCore initialized on port " << port
+             << " | session-server=" << cfg.sessionServerHost << ":" << cfg.sessionServerPort);
     return true;
 }
 
@@ -91,45 +97,71 @@ void ServerCore::Start()
 {
     m_running.store(true);
 
-    int threadCount = (int)std::thread::hardware_concurrency() * 2;
+    const auto& cfg = Config::Instance().Get();
+
+    int threadCount = static_cast<int>(std::thread::hardware_concurrency()) * cfg.workerThreadMultiplier;
     if (threadCount <= 0) threadCount = 4;
     for (int i = 0; i < threadCount; ++i) {
         m_workerThreads.emplace_back(&ServerCore::WorkerThread, this);
     }
 
-    m_tickThread = std::thread(&ServerCore::GameTickThread, this);
+    m_tickThread      = std::thread(&ServerCore::GameTickThread,  this);
+    m_heartbeatThread = std::thread(&ServerCore::HeartbeatThread, this);
+    m_statsThread     = std::thread(&ServerCore::StatsThread,     this);
 
     PostAccept();
 
     LOG_INFO("ServerCore started with " << threadCount << " worker threads");
 
-    for (auto& t : m_workerThreads) {
-        t.join();
-    }
+    for (auto& t : m_workerThreads) t.join();
 }
 
 void ServerCore::Stop()
 {
-    if (!m_running.exchange(false)) {
-        return; // 이미 멈춰 있음
-    }
+    if (!m_running.exchange(false)) return;
 
-    // overlapped=NULL인 완료 통지를 워커 수만큼 보내서 각 WorkerThread의
-    // GetQueuedCompletionStatus를 깨우고 루프를 빠져나가게 합니다.
     for (size_t i = 0; i < m_workerThreads.size(); ++i) {
         PostQueuedCompletionStatus(m_hIOCP, 0, 0, NULL);
     }
 
-    if (m_tickThread.joinable()) {
-        m_tickThread.join();
-    }
+    if (m_tickThread.joinable())      m_tickThread.join();
+    if (m_heartbeatThread.joinable()) m_heartbeatThread.join();
+    if (m_statsThread.joinable())     m_statsThread.join();
 }
 
 void ServerCore::GameTickThread()
 {
+    const auto interval = std::chrono::milliseconds(Config::Instance().Get().tickIntervalMs);
     while (m_running.load()) {
         RoomManager::Instance().TickAll();
-        std::this_thread::sleep_for(TICK_INTERVAL);
+        std::this_thread::sleep_for(interval);
+    }
+}
+
+void ServerCore::HeartbeatThread()
+{
+    constexpr auto CHECK_INTERVAL = std::chrono::seconds(5);
+    while (m_running.load()) {
+        std::this_thread::sleep_for(CHECK_INTERVAL);
+
+        int64_t timeoutMs = Config::Instance().Get().heartbeatTimeoutMs;
+        auto sessions = SessionManager::Instance().GetAll();
+        for (auto& session : sessions) {
+            if (session->IsTimedOut(timeoutMs)) {
+                LOG_WARN("Heartbeat timeout: sessionId=" << session->GetSessionId()
+                         << " accountId=" << session->GetAccountId());
+                HandleDisconnect(session);
+            }
+        }
+    }
+}
+
+void ServerCore::StatsThread()
+{
+    const auto interval = std::chrono::milliseconds(Config::Instance().Get().statsPrintIntervalMs);
+    while (m_running.load()) {
+        std::this_thread::sleep_for(interval);
+        ServerStats::Instance().Print();
     }
 }
 
@@ -147,14 +179,8 @@ void ServerCore::PostAccept()
     constexpr DWORD addrLen = sizeof(sockaddr_in) + 16;
 
     BOOL ok = m_acceptExFn(
-        m_listenSocket,
-        context->acceptSocket,
-        context->buffer,
-        0, // 초기 수신 데이터는 받지 않고 연결 수락만 함
-        addrLen,
-        addrLen,
-        &bytesReceived,
-        &context->overlapped);
+        m_listenSocket, context->acceptSocket, context->buffer,
+        0, addrLen, addrLen, &bytesReceived, &context->overlapped);
 
     if (!ok && WSAGetLastError() != WSA_IO_PENDING) {
         LOG_ERROR("AcceptEx failed: " << WSAGetLastError());
@@ -176,8 +202,6 @@ void ServerCore::HandleAcceptCompletion(IOContext* context, bool success)
         return;
     }
 
-    // AcceptEx로 만든 소켓은 리슨 소켓의 속성을 상속하므로, getpeername 등을
-    // 정상적으로 쓰려면 SO_UPDATE_ACCEPT_CONTEXT를 설정해줘야 합니다.
     setsockopt(clientSocket, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
                (char*)&m_listenSocket, sizeof(m_listenSocket));
 
@@ -196,36 +220,34 @@ void ServerCore::HandleAcceptCompletion(IOContext* context, bool success)
     }
 
     uint64_t sessionId = SessionManager::Instance().Add(session);
+    STATS_INC(totalConnections);
+    STATS_INC(currentConnections);
     LOG_INFO("Client connected. sessionId=" << sessionId);
 
     PostRecv(session);
-
-    // 다음 연결도 계속 받을 수 있도록 바로 재무장
     PostAccept();
 }
 
 void ServerCore::PostRecv(const std::shared_ptr<ServerSession>& session)
 {
-    if (session->IsDisconnected()) {
-        return;
-    }
+    if (session->IsDisconnected()) return;
 
-    IOContext* context = session->GetRecvContext();
+    IOContext*   context   = session->GetRecvContext();
+    RecvBuffer&  recvBuf   = session->GetRecvBuffer();
+
     std::memset(&context->overlapped, 0, sizeof(OVERLAPPED));
 
-    RecvBuffer& recvBuf = session->GetRecvBuffer();
-    // 항상 GetWriteBufferPtr() -> GetWriteBufferSize() 순서로 호출해야 합니다
-    // (필요하면 Ptr() 호출 시점에 내부적으로 압축이 일어납니다).
-    char* writePtr = recvBuf.GetWriteBufferPtr();
-    int writeSize = recvBuf.GetWriteBufferSize();
+    char* writePtr  = recvBuf.GetWriteBufferPtr();
+    int   writeSize = recvBuf.GetWriteBufferSize();
 
     context->wsaBuf.buf = writePtr;
     context->wsaBuf.len = writeSize;
 
-    DWORD recvBytes = 0;
-    DWORD flags = 0;
+    DWORD recvBytes = 0, flags = 0;
 
-    if (WSARecv(session->GetSocket(), &context->wsaBuf, 1, &recvBytes, &flags, &context->overlapped, NULL) == SOCKET_ERROR) {
+    if (WSARecv(session->GetSocket(), &context->wsaBuf, 1, &recvBytes, &flags,
+                &context->overlapped, NULL) == SOCKET_ERROR)
+    {
         if (WSAGetLastError() != WSA_IO_PENDING) {
             LOG_WARN("WSARecv failed: " << WSAGetLastError());
             HandleDisconnect(session);
@@ -233,14 +255,19 @@ void ServerCore::PostRecv(const std::shared_ptr<ServerSession>& session)
     }
 }
 
-void ServerCore::HandleRecv(const std::shared_ptr<ServerSession>& session, DWORD bytesTransferred, IOContext* /*ioContext*/)
+void ServerCore::HandleRecv(const std::shared_ptr<ServerSession>& session,
+                             DWORD bytesTransferred, IOContext* /*ioContext*/)
 {
     RecvBuffer& recvBuf = session->GetRecvBuffer();
     recvBuf.Write(bytesTransferred);
+    session->UpdateActivity();
+
+    STATS_ADD(totalBytesReceived, static_cast<uint64_t>(bytesTransferred));
 
     char* packetData = nullptr;
-    int packetSize = 0;
+    int   packetSize = 0;
     while (recvBuf.TryGetPacket(packetData, packetSize)) {
+        STATS_INC(totalPacketsReceived);
         m_packetManager.HandlePacket(session, packetData, packetSize);
         recvBuf.Pop(packetSize);
     }
@@ -250,11 +277,10 @@ void ServerCore::HandleRecv(const std::shared_ptr<ServerSession>& session, DWORD
 
 void ServerCore::HandleDisconnect(const std::shared_ptr<ServerSession>& session)
 {
-    if (!session->Disconnect()) {
-        return; // 다른 스레드가 이미 처리함
-    }
+    if (!session->Disconnect()) return;
 
     LOG_INFO("Client disconnected. sessionId=" << session->GetSessionId());
+    STATS_DEC(currentConnections);
     SessionManager::Instance().Remove(session->GetSessionId());
 
     GameRoom* room = session->GetRoom();
@@ -267,16 +293,14 @@ void ServerCore::HandleDisconnect(const std::shared_ptr<ServerSession>& session)
 void ServerCore::WorkerThread()
 {
     while (true) {
-        DWORD bytesTransferred = 0;
-        ULONG_PTR completionKey = 0;
-        LPOVERLAPPED overlapped = nullptr;
+        DWORD      bytesTransferred = 0;
+        ULONG_PTR  completionKey    = 0;
+        LPOVERLAPPED overlapped     = nullptr;
 
         BOOL success = GetQueuedCompletionStatus(
             m_hIOCP, &bytesTransferred, &completionKey, &overlapped, INFINITE);
 
-        if (overlapped == nullptr) {
-            break; // Stop()이 보낸 종료 신호
-        }
+        if (overlapped == nullptr) break; // Stop() 신호
 
         IOContext* context = reinterpret_cast<IOContext*>(overlapped);
 
@@ -285,20 +309,15 @@ void ServerCore::WorkerThread()
             continue;
         }
 
-        // RECV/SEND는 IOContext가 직접 들고 있는 shared_ptr로 세션을 얻습니다 -
-        // 이 I/O가 진행 중인 한 세션은 절대 삭제되지 않습니다.
         std::shared_ptr<ServerSession> session = context->session;
 
         if (!success) {
             HandleDisconnect(session);
-            if (context->ioType == EIOType::SEND) {
-                g_ioContextPool.Deallocate(context);
-            }
+            if (context->ioType == EIOType::SEND) g_ioContextPool.Deallocate(context);
             continue;
         }
 
         if (context->ioType == EIOType::RECV && bytesTransferred == 0) {
-            // 상대가 정상적으로 연결을 닫음 (그레이스풀 클로즈)
             HandleDisconnect(session);
             continue;
         }
