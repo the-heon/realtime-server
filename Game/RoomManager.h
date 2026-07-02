@@ -24,10 +24,16 @@ public:
     GameRoom* GetOrCreate(const std::string& name);
     GameRoom* Find(const std::string& name);
 
-    void TickAll();
+    void TickAll(int reconnectWindowMs = 30000);
 
     // 현재 존재하는 모든 룸의 정보 스냅샷 (C_ROOM_LIST 응답용)
     std::vector<RoomInfo> GetRoomInfoList() const;
+
+    // idleMs 동안 아무도 없는 룸을 제거합니다 (HeartbeatThread에서 호출)
+    int RemoveIdleRooms(int64_t idleMs);
+
+    // accountId에 재접속 슬롯이 있는 룸을 반환합니다 (없으면 nullptr)
+    GameRoom* FindReconnect(const std::string& accountId);
 
 private:
     RoomManager() = default;

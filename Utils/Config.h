@@ -16,8 +16,23 @@ struct ServerConfig
     // session-server 연동 (토큰 검증용 내부망 직접 호출)
     std::string sessionServerHost    = "127.0.0.1";
     int         sessionServerPort    = 8080;
-    int         authWorkerCount      = 4;    // AuthService 전용 스레드 수
-    int         authTimeoutMs        = 3000; // session-server HTTP 타임아웃
+    int         authWorkerCount      = 4;
+    int         authTimeoutMs        = 3000;
+
+    // 자가 등록 (session-server의 게임서버 레지스트리에 등록)
+    std::string externalHost         = "127.0.0.1"; // 클라이언트에게 노출될 IP
+    int         maxTotalPlayers      = 500;          // 레지스트리 등록 시 사용
+
+    // 헬스체크 HTTP 서버
+    int healthServerPort             = 8081;
+
+    // 보안 / 패킷 가드
+    int maxPacketSize                = 4096; // bytes, 초과 시 세션 강제 종료
+    int packetRateLimitPerSec        = 100;  // 초당 최대 패킷 수 (burst = *2)
+
+    // 룸 GC
+    int idleRoomTimeoutMs            = 60000; // 빈 룸 유지 시간 (ms)
+    int reconnectWindowMs            = 30000; // 재접속 허용 시간 (ms)
 };
 
 // key=value 형식 설정 파일 로더. 파일이 없으면 기본값 유지.
@@ -77,6 +92,18 @@ private:
         m_cfg.sessionServerPort      = getInt("session_server_port",      m_cfg.sessionServerPort);
         m_cfg.authWorkerCount        = getInt("auth_worker_count",        m_cfg.authWorkerCount);
         m_cfg.authTimeoutMs          = getInt("auth_timeout_ms",          m_cfg.authTimeoutMs);
+
+        auto getStrOrDefault = [&](const std::string& k, const std::string& def) -> std::string {
+            auto it = m_values.find(k);
+            return (it != m_values.end() && !it->second.empty()) ? it->second : def;
+        };
+        m_cfg.externalHost           = getStrOrDefault("external_host",          m_cfg.externalHost);
+        m_cfg.maxTotalPlayers        = getInt("max_total_players",               m_cfg.maxTotalPlayers);
+        m_cfg.healthServerPort       = getInt("health_server_port",              m_cfg.healthServerPort);
+        m_cfg.maxPacketSize          = getInt("max_packet_size",                 m_cfg.maxPacketSize);
+        m_cfg.packetRateLimitPerSec  = getInt("packet_rate_limit_per_sec",       m_cfg.packetRateLimitPerSec);
+        m_cfg.idleRoomTimeoutMs      = getInt("idle_room_timeout_ms",            m_cfg.idleRoomTimeoutMs);
+        m_cfg.reconnectWindowMs      = getInt("reconnect_window_ms",             m_cfg.reconnectWindowMs);
     }
 
     static std::string Trim(const std::string& s)

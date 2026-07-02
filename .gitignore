@@ -44,3 +44,8 @@
 
 # CMake out-of-source build directory
 /build/
+cmake-build-*/
+
+# 로컬 설정 오버라이드 (server.cfg는 공유, server.cfg.local은 무시)
+server.cfg.local
+*.local.cfg

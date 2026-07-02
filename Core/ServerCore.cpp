@@ -6,8 +6,10 @@
 #include "../Utils/Config.h"
 #include "../Utils/ServerStats.h"
 #include "../Utils/AuthService.h"
+#include "../Utils/HttpClient.h"
 #include <ws2tcpip.h>
 #include <cstring>
+#include <sstream>
 
 ObjectPool<IOContext> g_ioContextPool;
 
@@ -15,7 +17,10 @@ ServerCore::ServerCore() = default;
 
 ServerCore::~ServerCore()
 {
+    UnregisterFromSessionServer();
+    m_healthServer.Stop();
     Stop();
+    if (m_registryThread.joinable()) m_registryThread.join();
     if (m_listenSocket != INVALID_SOCKET) closesocket(m_listenSocket);
     if (m_hIOCP != INVALID_HANDLE_VALUE) CloseHandle(m_hIOCP);
     WSACleanup();
@@ -88,8 +93,27 @@ bool ServerCore::Init(int port)
     // AuthService 시작 (session-server 토큰 검증 전용 스레드 풀)
     AuthService::Instance().Start(cfg.authWorkerCount);
 
+    // 헬스체크 HTTP 서버 시작
+    m_healthServer.Start(cfg.healthServerPort, [this]() {
+        const auto& s = ServerStats::Instance();
+        std::ostringstream oss;
+        oss << "{"
+            << "\"status\":\"ok\","
+            << "\"sessions\":" << s.currentConnections.load(std::memory_order_relaxed) << ","
+            << "\"total_connections\":" << s.totalConnections.load(std::memory_order_relaxed) << ","
+            << "\"rooms\":" << RoomManager::Instance().GetRoomInfoList().size() << ","
+            << "\"packets_received\":" << s.totalPacketsReceived.load(std::memory_order_relaxed) << ","
+            << "\"packets_sent\":" << s.totalPacketsSent.load(std::memory_order_relaxed)
+            << "}";
+        return oss.str();
+    });
+
+    // session-server에 자가 등록
+    RegisterWithSessionServer();
+
     LOG_INFO("ServerCore initialized on port " << port
-             << " | session-server=" << cfg.sessionServerHost << ":" << cfg.sessionServerPort);
+             << " | session-server=" << cfg.sessionServerHost << ":" << cfg.sessionServerPort
+             << " | health-port=" << cfg.healthServerPort);
     return true;
 }
 
@@ -108,6 +132,7 @@ void ServerCore::Start()
     m_tickThread      = std::thread(&ServerCore::GameTickThread,  this);
     m_heartbeatThread = std::thread(&ServerCore::HeartbeatThread, this);
     m_statsThread     = std::thread(&ServerCore::StatsThread,     this);
+    m_registryThread  = std::thread(&ServerCore::RegistryThread,  this);
 
     PostAccept();
 
@@ -131,9 +156,10 @@ void ServerCore::Stop()
 
 void ServerCore::GameTickThread()
 {
-    const auto interval = std::chrono::milliseconds(Config::Instance().Get().tickIntervalMs);
+    const auto& cfg = Config::Instance().Get();
+    const auto interval = std::chrono::milliseconds(cfg.tickIntervalMs);
     while (m_running.load()) {
-        RoomManager::Instance().TickAll();
+        RoomManager::Instance().TickAll(cfg.reconnectWindowMs);
         std::this_thread::sleep_for(interval);
     }
 }
@@ -144,7 +170,10 @@ void ServerCore::HeartbeatThread()
     while (m_running.load()) {
         std::this_thread::sleep_for(CHECK_INTERVAL);
 
-        int64_t timeoutMs = Config::Instance().Get().heartbeatTimeoutMs;
+        const auto& cfg = Config::Instance().Get();
+
+        // 세션 타임아웃 체크
+        int64_t timeoutMs = cfg.heartbeatTimeoutMs;
         auto sessions = SessionManager::Instance().GetAll();
         for (auto& session : sessions) {
             if (session->IsTimedOut(timeoutMs)) {
@@ -152,6 +181,12 @@ void ServerCore::HeartbeatThread()
                          << " accountId=" << session->GetAccountId());
                 HandleDisconnect(session);
             }
+        }
+
+        // 빈 룸 GC
+        int removed = RoomManager::Instance().RemoveIdleRooms(cfg.idleRoomTimeoutMs);
+        if (removed > 0) {
+            LOG_INFO("RoomGC: removed " << removed << " idle room(s)");
         }
     }
 }
@@ -220,6 +255,7 @@ void ServerCore::HandleAcceptCompletion(IOContext* context, bool success)
     }
 
     uint64_t sessionId = SessionManager::Instance().Add(session);
+    session->InitRateLimit(Config::Instance().Get().packetRateLimitPerSec);
     STATS_INC(totalConnections);
     STATS_INC(currentConnections);
     LOG_INFO("Client connected. sessionId=" << sessionId);
@@ -264,9 +300,24 @@ void ServerCore::HandleRecv(const std::shared_ptr<ServerSession>& session,
 
     STATS_ADD(totalBytesReceived, static_cast<uint64_t>(bytesTransferred));
 
+    const int maxPacketSize = Config::Instance().Get().maxPacketSize;
     char* packetData = nullptr;
     int   packetSize = 0;
     while (recvBuf.TryGetPacket(packetData, packetSize)) {
+        // 패킷 크기 제한
+        if (packetSize > maxPacketSize) {
+            LOG_WARN("Oversized packet (" << packetSize << " bytes) from sessionId="
+                     << session->GetSessionId() << " - disconnecting");
+            HandleDisconnect(session);
+            return;
+        }
+        // 패킷 속도 제한
+        if (!session->CheckRateLimit()) {
+            LOG_WARN("Rate limit exceeded: sessionId=" << session->GetSessionId()
+                     << " accountId=" << session->GetAccountId() << " - disconnecting");
+            HandleDisconnect(session);
+            return;
+        }
         STATS_INC(totalPacketsReceived);
         m_packetManager.HandlePacket(session, packetData, packetSize);
         recvBuf.Pop(packetSize);
@@ -333,4 +384,78 @@ void ServerCore::WorkerThread()
                 break;
         }
     }
+}
+
+// ───────────────────────────────────────────────
+//  Game Server Registry 연동
+// ───────────────────────────────────────────────
+
+static std::string ParseJsonString(const std::string& json, const std::string& key)
+{
+    // "key":"value" 패턴을 단순 파싱 (외부 라이브러리 없이)
+    std::string search = "\"" + key + "\":\"";
+    auto pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos += search.size();
+    auto end = json.find('"', pos);
+    return end == std::string::npos ? "" : json.substr(pos, end - pos);
+}
+
+void ServerCore::RegisterWithSessionServer()
+{
+    const auto& cfg = Config::Instance().Get();
+
+    std::ostringstream body;
+    body << "{"
+         << "\"host\":\"" << cfg.externalHost << "\","
+         << "\"port\":"   << cfg.port << ","
+         << "\"max_players\":" << cfg.maxTotalPlayers
+         << "}";
+
+    auto resp = HttpClient::Post(cfg.sessionServerHost, cfg.sessionServerPort,
+                                 "/game-server/register", body.str(), cfg.authTimeoutMs);
+    if (resp.ok()) {
+        m_gameServerId = ParseJsonString(resp.body, "id");
+        LOG_INFO("Registered with session-server. server_id=" << m_gameServerId);
+    } else {
+        LOG_WARN("Failed to register with session-server (status=" << resp.statusCode
+                 << "). Matchmaking will not route clients to this server.");
+    }
+}
+
+void ServerCore::RegistryThread()
+{
+    // 10초마다 session-server에 heartbeat 전송
+    constexpr auto INTERVAL = std::chrono::seconds(10);
+    while (m_running.load()) {
+        std::this_thread::sleep_for(INTERVAL);
+        if (m_gameServerId.empty()) continue;
+
+        const auto& cfg = Config::Instance().Get();
+        int currentPlayers = static_cast<int>(
+            ServerStats::Instance().currentConnections.load(std::memory_order_relaxed));
+
+        std::ostringstream body;
+        body << "{\"id\":\"" << m_gameServerId << "\","
+             << "\"current_players\":" << currentPlayers << "}";
+
+        auto resp = HttpClient::Post(cfg.sessionServerHost, cfg.sessionServerPort,
+                                     "/game-server/heartbeat", body.str(), cfg.authTimeoutMs);
+        if (!resp.ok()) {
+            LOG_WARN("Heartbeat failed (status=" << resp.statusCode << ") - re-registering");
+            RegisterWithSessionServer();
+        }
+    }
+}
+
+void ServerCore::UnregisterFromSessionServer()
+{
+    if (m_gameServerId.empty()) return;
+
+    const auto& cfg = Config::Instance().Get();
+    std::string body = "{\"id\":\"" + m_gameServerId + "\"}";
+    HttpClient::Post(cfg.sessionServerHost, cfg.sessionServerPort,
+                     "/game-server/unregister", body, cfg.authTimeoutMs);
+    LOG_INFO("Unregistered from session-server. server_id=" << m_gameServerId);
+    m_gameServerId.clear();
 }

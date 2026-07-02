@@ -6,8 +6,10 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <string>
 #include "ServerSession.h"
 #include "../Packet/PacketManager.h"
+#include "../Utils/HealthServer.h"
 
 class ServerCore
 {
@@ -44,4 +46,16 @@ private:
     std::thread              m_tickThread;
     std::thread              m_heartbeatThread;
     std::thread              m_statsThread;
+    std::thread              m_registryThread;
+
+    HealthServer m_healthServer;
+    std::string  m_gameServerId; // session-server에서 발급받은 서버 ID
+
+    void RegistryThread(); // session-server에 heartbeat 전송
+    void RegisterWithSessionServer();
+    void UnregisterFromSessionServer();
+
+    // JSON 직렬화 없이 간단히 문자열 조합
+    static std::string BuildJson(const std::string& key, const std::string& val)
+    { return "{\"" + key + "\":\"" + val + "\"}"; }
 };

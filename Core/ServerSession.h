@@ -77,6 +77,42 @@ public:
     GameRoom* GetRoom() const { return m_room.load(std::memory_order_acquire); }
     void      SetRoom(GameRoom* room) { m_room.store(room, std::memory_order_release); }
 
+    // --- 패킷 레이트 리밋 (토큰 버킷) ---
+    // HandleRecv에서 패킷마다 호출합니다. 초과 시 false → 세션 강제 종료.
+    // 설정된 rate(초당 X개), burst(rate*2)로 동작합니다.
+    void InitRateLimit(int ratePerSec)
+    {
+        m_rateBurst = ratePerSec * 2;
+        m_rateTokens.store(m_rateBurst, std::memory_order_relaxed);
+        using namespace std::chrono;
+        m_lastRefillMs.store(
+            duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
+    }
+
+    bool CheckRateLimit()
+    {
+        using namespace std::chrono;
+        int64_t now = duration_cast<milliseconds>(
+            steady_clock::now().time_since_epoch()).count();
+        int64_t last = m_lastRefillMs.load(std::memory_order_relaxed);
+        int64_t elapsed = now - last;
+
+        if (elapsed > 0 && m_rateBurst > 0) {
+            // refillPerMs = ratePerSec / 1000 → multiply to avoid float
+            int refill = static_cast<int>(elapsed * (m_rateBurst / 2) / 1000);
+            if (refill > 0) {
+                int cur = m_rateTokens.load(std::memory_order_relaxed);
+                m_rateTokens.store(std::min(m_rateBurst, cur + refill),
+                                   std::memory_order_relaxed);
+                m_lastRefillMs.store(now, std::memory_order_relaxed);
+            }
+        }
+
+        int prev = m_rateTokens.fetch_sub(1, std::memory_order_relaxed);
+        return prev > 0;
+    }
+
     // --- 하트비트 ---
     // Recv 완료 시마다 호출해 마지막 활동 시간을 갱신합니다.
     void UpdateActivity()
@@ -126,6 +162,11 @@ private:
 
     // 마지막 수신 시각 (ms, steady_clock 기준)
     std::atomic<int64_t> m_lastActivityMs{ 0 };
+
+    // 패킷 레이트 리밋 (토큰 버킷)
+    int                  m_rateBurst{ 0 };
+    std::atomic<int>     m_rateTokens{ 0 };
+    std::atomic<int64_t> m_lastRefillMs{ 0 };
 
     static constexpr int RECV_BUF_CAPACITY = 8192;
     RecvBuffer m_recvBuffer{ RECV_BUF_CAPACITY };
