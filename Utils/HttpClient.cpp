@@ -21,15 +21,17 @@ HttpClient::Response HttpClient::Get(const std::string& host, int port,
 
 HttpClient::Response HttpClient::Post(const std::string& host, int port,
                                        const std::string& path,
-                                       const std::string& body, int timeoutMs)
+                                       const std::string& body, int timeoutMs,
+                                       const Headers& headers)
 {
-    return DoRequest("POST", host, port, path, body, timeoutMs);
+    return DoRequest("POST", host, port, path, body, timeoutMs, headers);
 }
 
 HttpClient::Response HttpClient::DoRequest(const std::string& method,
                                             const std::string& host, int port,
                                             const std::string& path,
-                                            const std::string& body, int timeoutMs)
+                                            const std::string& body, int timeoutMs,
+                                            const Headers& headers)
 {
     Response result;
 
@@ -67,19 +69,30 @@ HttpClient::Response HttpClient::DoRequest(const std::string& method,
         return result;
     }
 
-    LPCWSTR headers    = WINHTTP_NO_ADDITIONAL_HEADERS;
+    std::wstring requestHeaders;
+    if (!body.empty()) {
+        requestHeaders += L"Content-Type: application/json\r\n";
+    }
+    for (const auto& h : headers) {
+        requestHeaders += ToWide(h.name + ": " + h.value + "\r\n");
+    }
+
+    LPCWSTR headersPtr = WINHTTP_NO_ADDITIONAL_HEADERS;
     DWORD   headersLen = 0;
+    if (!requestHeaders.empty()) {
+        headersPtr = requestHeaders.c_str();
+        headersLen = static_cast<DWORD>(requestHeaders.size());
+    }
+
     LPVOID  bodyPtr    = WINHTTP_NO_REQUEST_DATA;
     DWORD   bodyLen    = 0;
 
     if (!body.empty()) {
-        headers    = L"Content-Type: application/json\r\n";
-        headersLen = static_cast<DWORD>(-1L); // null-terminated
         bodyPtr    = const_cast<char*>(body.c_str());
         bodyLen    = static_cast<DWORD>(body.size());
     }
 
-    BOOL sent = WinHttpSendRequest(hRequest, headers, headersLen,
+    BOOL sent = WinHttpSendRequest(hRequest, headersPtr, headersLen,
                                    bodyPtr, bodyLen, bodyLen, 0);
 
     if (!sent || !WinHttpReceiveResponse(hRequest, nullptr)) {

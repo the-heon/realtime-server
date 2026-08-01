@@ -8,6 +8,7 @@
 #include "../Utils/AuthService.h"
 #include "../Utils/HttpClient.h"
 #include <ws2tcpip.h>
+#include <algorithm>
 #include <cstring>
 #include <sstream>
 
@@ -17,7 +18,6 @@ ServerCore::ServerCore() = default;
 
 ServerCore::~ServerCore()
 {
-    UnregisterFromSessionServer();
     m_healthServer.Stop();
     Stop();
     if (m_registryThread.joinable()) m_registryThread.join();
@@ -93,7 +93,7 @@ bool ServerCore::Init(int port)
     // AuthService 시작 (session-server 토큰 검증 전용 스레드 풀)
     AuthService::Instance().Start(cfg.authWorkerCount);
 
-    // 헬스체크 HTTP 서버 시작
+    // 헬스체크/메트릭 HTTP 서버 시작
     m_healthServer.Start(cfg.healthServerPort, [this]() {
         const auto& s = ServerStats::Instance();
         std::ostringstream oss;
@@ -103,16 +103,31 @@ bool ServerCore::Init(int port)
             << "\"total_connections\":" << s.totalConnections.load(std::memory_order_relaxed) << ","
             << "\"rooms\":" << RoomManager::Instance().GetRoomInfoList().size() << ","
             << "\"packets_received\":" << s.totalPacketsReceived.load(std::memory_order_relaxed) << ","
-            << "\"packets_sent\":" << s.totalPacketsSent.load(std::memory_order_relaxed)
+            << "\"packets_sent\":" << s.totalPacketsSent.load(std::memory_order_relaxed) << ","
+            << "\"rate_limit_rejections\":" << s.totalRateLimitRejections.load(std::memory_order_relaxed) << ","
+            << "\"oversized_rejections\":" << s.totalOversizedPacketRejections.load(std::memory_order_relaxed) << ","
+            << "\"control_plane_status_code\":" << m_lastControlPlaneStatusCode.load(std::memory_order_relaxed) << ","
+            << "\"last_report_unix_ms\":" << m_lastControlPlaneReportUnixMs.load(std::memory_order_relaxed)
             << "}";
+        return oss.str();
+    }, [this]() {
+        const auto& s = ServerStats::Instance();
+        std::ostringstream oss;
+        oss << "realtime_current_connections " << s.currentConnections.load(std::memory_order_relaxed) << "\n"
+            << "realtime_total_connections " << s.totalConnections.load(std::memory_order_relaxed) << "\n"
+            << "realtime_packets_received_total " << s.totalPacketsReceived.load(std::memory_order_relaxed) << "\n"
+            << "realtime_packets_sent_total " << s.totalPacketsSent.load(std::memory_order_relaxed) << "\n"
+            << "realtime_bytes_received_total " << s.totalBytesReceived.load(std::memory_order_relaxed) << "\n"
+            << "realtime_bytes_sent_total " << s.totalBytesSent.load(std::memory_order_relaxed) << "\n"
+            << "realtime_rate_limit_rejections_total " << s.totalRateLimitRejections.load(std::memory_order_relaxed) << "\n"
+            << "realtime_oversized_rejections_total " << s.totalOversizedPacketRejections.load(std::memory_order_relaxed) << "\n"
+            << "realtime_control_plane_status_code " << m_lastControlPlaneStatusCode.load(std::memory_order_relaxed) << "\n"
+            << "realtime_last_report_unix_ms " << m_lastControlPlaneReportUnixMs.load(std::memory_order_relaxed) << "\n";
         return oss.str();
     });
 
-    // session-server에 자가 등록
-    RegisterWithSessionServer();
-
     LOG_INFO("ServerCore initialized on port " << port
-             << " | session-server=" << cfg.sessionServerHost << ":" << cfg.sessionServerPort
+             << " | control-plane=" << cfg.apiGatewayHost << ":" << cfg.apiGatewayPort
              << " | health-port=" << cfg.healthServerPort);
     return true;
 }
@@ -308,6 +323,7 @@ void ServerCore::HandleRecv(const std::shared_ptr<ServerSession>& session,
         if (packetSize > maxPacketSize) {
             LOG_WARN("Oversized packet (" << packetSize << " bytes) from sessionId="
                      << session->GetSessionId() << " - disconnecting");
+            STATS_INC(totalOversizedPacketRejections);
             HandleDisconnect(session);
             return;
         }
@@ -315,6 +331,7 @@ void ServerCore::HandleRecv(const std::shared_ptr<ServerSession>& session,
         if (!session->CheckRateLimit()) {
             LOG_WARN("Rate limit exceeded: sessionId=" << session->GetSessionId()
                      << " accountId=" << session->GetAccountId() << " - disconnecting");
+            STATS_INC(totalRateLimitRejections);
             HandleDisconnect(session);
             return;
         }
@@ -386,76 +403,72 @@ void ServerCore::WorkerThread()
     }
 }
 
-// ───────────────────────────────────────────────
-//  Game Server Registry 연동
-// ───────────────────────────────────────────────
-
-static std::string ParseJsonString(const std::string& json, const std::string& key)
-{
-    // "key":"value" 패턴을 단순 파싱 (외부 라이브러리 없이)
-    std::string search = "\"" + key + "\":\"";
-    auto pos = json.find(search);
-    if (pos == std::string::npos) return "";
-    pos += search.size();
-    auto end = json.find('"', pos);
-    return end == std::string::npos ? "" : json.substr(pos, end - pos);
-}
-
-void ServerCore::RegisterWithSessionServer()
-{
-    const auto& cfg = Config::Instance().Get();
-
-    std::ostringstream body;
-    body << "{"
-         << "\"host\":\"" << cfg.externalHost << "\","
-         << "\"port\":"   << cfg.port << ","
-         << "\"max_players\":" << cfg.maxTotalPlayers
-         << "}";
-
-    auto resp = HttpClient::Post(cfg.sessionServerHost, cfg.sessionServerPort,
-                                 "/game-server/register", body.str(), cfg.authTimeoutMs);
-    if (resp.ok()) {
-        m_gameServerId = ParseJsonString(resp.body, "id");
-        LOG_INFO("Registered with session-server. server_id=" << m_gameServerId);
-    } else {
-        LOG_WARN("Failed to register with session-server (status=" << resp.statusCode
-                 << "). Matchmaking will not route clients to this server.");
-    }
-}
-
 void ServerCore::RegistryThread()
 {
-    // 10초마다 session-server에 heartbeat 전송
-    constexpr auto INTERVAL = std::chrono::seconds(10);
-    while (m_running.load()) {
-        std::this_thread::sleep_for(INTERVAL);
-        if (m_gameServerId.empty()) continue;
+    uint64_t prevTotalConnections = 0;
+    uint64_t prevTotalRejections = 0;
 
+    while (m_running.load()) {
         const auto& cfg = Config::Instance().Get();
-        int currentPlayers = static_cast<int>(
-            ServerStats::Instance().currentConnections.load(std::memory_order_relaxed));
+        const auto intervalMs = std::max(1000, cfg.heartbeatReportIntervalMs);
+        std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+
+        if (cfg.gameServerApiKey.empty()) {
+            LOG_WARN("game_server_api_key is empty; skipping heartbeat report");
+            continue;
+        }
+
+        const auto& s = ServerStats::Instance();
+        uint64_t totalConnections = s.totalConnections.load(std::memory_order_relaxed);
+        uint64_t totalRejections =
+            s.totalRateLimitRejections.load(std::memory_order_relaxed) +
+            s.totalOversizedPacketRejections.load(std::memory_order_relaxed);
+
+        uint64_t recentConnections = (totalConnections >= prevTotalConnections)
+            ? (totalConnections - prevTotalConnections)
+            : totalConnections;
+        uint64_t recentRejections = (totalRejections >= prevTotalRejections)
+            ? (totalRejections - prevTotalRejections)
+            : totalRejections;
+
+        prevTotalConnections = totalConnections;
+        prevTotalRejections = totalRejections;
+
+        int currentPlayers = static_cast<int>(s.currentConnections.load(std::memory_order_relaxed));
 
         std::ostringstream body;
-        body << "{\"id\":\"" << m_gameServerId << "\","
-             << "\"current_players\":" << currentPlayers << "}";
+        body << "{"
+             << "\"currentPlayers\":" << currentPlayers << ","
+             << "\"maxPlayers\":" << cfg.maxTotalPlayers << ","
+             << "\"version\":\"" << cfg.gameServerVersion << "\"," 
+             << "\"recentConnections\":" << recentConnections << ","
+             << "\"recentRejections\":" << recentRejections
+             << "}";
 
-        auto resp = HttpClient::Post(cfg.sessionServerHost, cfg.sessionServerPort,
-                                     "/game-server/heartbeat", body.str(), cfg.authTimeoutMs);
+        HttpClient::Headers headers = {
+            {"X-Api-Key", cfg.gameServerApiKey},
+        };
+
+        auto resp = HttpClient::Post(
+            cfg.apiGatewayHost,
+            cfg.apiGatewayPort,
+            "/api/game-servers/heartbeat",
+            body.str(),
+            cfg.controlPlaneTimeoutMs,
+            headers);
+
+        m_lastControlPlaneStatusCode.store(resp.statusCode, std::memory_order_relaxed);
+        auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        m_lastControlPlaneReportUnixMs.store(nowMs, std::memory_order_relaxed);
+
         if (!resp.ok()) {
-            LOG_WARN("Heartbeat failed (status=" << resp.statusCode << ") - re-registering");
-            RegisterWithSessionServer();
+            LOG_WARN("Heartbeat report failed (status=" << resp.statusCode
+                     << ", body=" << resp.body << ")");
+        } else {
+            LOG_INFO("Heartbeat report sent: players=" << currentPlayers
+                     << " recentConnections=" << recentConnections
+                     << " recentRejections=" << recentRejections);
         }
     }
-}
-
-void ServerCore::UnregisterFromSessionServer()
-{
-    if (m_gameServerId.empty()) return;
-
-    const auto& cfg = Config::Instance().Get();
-    std::string body = "{\"id\":\"" + m_gameServerId + "\"}";
-    HttpClient::Post(cfg.sessionServerHost, cfg.sessionServerPort,
-                     "/game-server/unregister", body, cfg.authTimeoutMs);
-    LOG_INFO("Unregistered from session-server. server_id=" << m_gameServerId);
-    m_gameServerId.clear();
 }

@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <string>
+#include <vector>
 
 // WinHTTP 기반 동기 HTTP 클라이언트.
 // AuthService의 전용 스레드에서만 호출하므로 동기 방식으로 구현합니다.
@@ -9,6 +10,13 @@
 class HttpClient
 {
 public:
+    struct Header {
+        std::string name;
+        std::string value;
+    };
+
+    using Headers = std::vector<Header>;
+
     struct Response
     {
         int         statusCode = 0;
@@ -23,11 +31,13 @@ public:
     // 동기 POST 요청 (Content-Type: application/json). 실패 시 statusCode=0 반환.
     static Response Post(const std::string& host, int port,
                          const std::string& path, const std::string& body,
-                         int timeoutMs = 3000);
+                         int timeoutMs = 3000,
+                         const Headers& headers = {});
 
 private:
     static std::wstring ToWide(const std::string& s);
     static Response DoRequest(const std::string& method, const std::string& host,
                               int port, const std::string& path,
-                              const std::string& body, int timeoutMs);
+                              const std::string& body, int timeoutMs,
+                              const Headers& headers = {});
 };
