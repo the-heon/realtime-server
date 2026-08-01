@@ -11,8 +11,65 @@
 #include <algorithm>
 #include <cstring>
 #include <sstream>
+#include <cctype>
 
 ObjectPool<IOContext> g_ioContextPool;
+
+static int64_t UnixTimeMsNow()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static bool TryParseJsonIntByKey(const std::string& json, const std::string& key, int& out)
+{
+    const std::string marker = "\"" + key + "\":";
+    auto pos = json.find(marker);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    pos += marker.size();
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) {
+        ++pos;
+    }
+    if (pos >= json.size() || json.compare(pos, 4, "null") == 0) {
+        return false;
+    }
+
+    bool neg = false;
+    if (json[pos] == '-') {
+        neg = true;
+        ++pos;
+    }
+
+    int value = 0;
+    bool hasDigit = false;
+    while (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos]))) {
+        hasDigit = true;
+        value = value * 10 + (json[pos] - '0');
+        ++pos;
+    }
+    if (!hasDigit) {
+        return false;
+    }
+
+    out = neg ? -value : value;
+    return true;
+}
+
+static bool IsJsonNullByKey(const std::string& json, const std::string& key)
+{
+    const std::string marker = "\"" + key + "\":";
+    auto pos = json.find(marker);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    pos += marker.size();
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) {
+        ++pos;
+    }
+    return pos < json.size() && json.compare(pos, 4, "null") == 0;
+}
 
 ServerCore::ServerCore() = default;
 
@@ -106,8 +163,12 @@ bool ServerCore::Init(int port)
             << "\"packets_sent\":" << s.totalPacketsSent.load(std::memory_order_relaxed) << ","
             << "\"rate_limit_rejections\":" << s.totalRateLimitRejections.load(std::memory_order_relaxed) << ","
             << "\"oversized_rejections\":" << s.totalOversizedPacketRejections.load(std::memory_order_relaxed) << ","
+            << "\"policy_connection_rejections\":" << s.totalPolicyConnectionRejections.load(std::memory_order_relaxed) << ","
             << "\"control_plane_status_code\":" << m_lastControlPlaneStatusCode.load(std::memory_order_relaxed) << ","
-            << "\"last_report_unix_ms\":" << m_lastControlPlaneReportUnixMs.load(std::memory_order_relaxed)
+            << "\"last_report_unix_ms\":" << m_lastControlPlaneReportUnixMs.load(std::memory_order_relaxed) << ","
+            << "\"policy_pull_status_code\":" << m_lastPolicyPullStatusCode.load(std::memory_order_relaxed) << ","
+            << "\"last_policy_pull_unix_ms\":" << m_lastPolicyPullUnixMs.load(std::memory_order_relaxed) << ","
+            << "\"max_conn_per_min_total\":" << m_policyMaxConnectionsPerMinuteTotal.load(std::memory_order_relaxed)
             << "}";
         return oss.str();
     }, [this]() {
@@ -121,8 +182,12 @@ bool ServerCore::Init(int port)
             << "realtime_bytes_sent_total " << s.totalBytesSent.load(std::memory_order_relaxed) << "\n"
             << "realtime_rate_limit_rejections_total " << s.totalRateLimitRejections.load(std::memory_order_relaxed) << "\n"
             << "realtime_oversized_rejections_total " << s.totalOversizedPacketRejections.load(std::memory_order_relaxed) << "\n"
+            << "realtime_policy_connection_rejections_total " << s.totalPolicyConnectionRejections.load(std::memory_order_relaxed) << "\n"
             << "realtime_control_plane_status_code " << m_lastControlPlaneStatusCode.load(std::memory_order_relaxed) << "\n"
-            << "realtime_last_report_unix_ms " << m_lastControlPlaneReportUnixMs.load(std::memory_order_relaxed) << "\n";
+            << "realtime_last_report_unix_ms " << m_lastControlPlaneReportUnixMs.load(std::memory_order_relaxed) << "\n"
+            << "realtime_policy_pull_status_code " << m_lastPolicyPullStatusCode.load(std::memory_order_relaxed) << "\n"
+            << "realtime_last_policy_pull_unix_ms " << m_lastPolicyPullUnixMs.load(std::memory_order_relaxed) << "\n"
+            << "realtime_policy_max_connections_per_min_total " << m_policyMaxConnectionsPerMinuteTotal.load(std::memory_order_relaxed) << "\n";
         return oss.str();
     });
 
@@ -270,6 +335,15 @@ void ServerCore::HandleAcceptCompletion(IOContext* context, bool success)
     }
 
     uint64_t sessionId = SessionManager::Instance().Add(session);
+    if (!ConsumeGlobalConnectionToken()) {
+        LOG_WARN("Global connection policy exceeded - closing sessionId=" << sessionId);
+        STATS_INC(totalPolicyConnectionRejections);
+        session->Disconnect();
+        SessionManager::Instance().Remove(sessionId);
+        PostAccept();
+        return;
+    }
+
     session->InitRateLimit(Config::Instance().Get().packetRateLimitPerSec);
     STATS_INC(totalConnections);
     STATS_INC(currentConnections);
@@ -407,11 +481,18 @@ void ServerCore::RegistryThread()
 {
     uint64_t prevTotalConnections = 0;
     uint64_t prevTotalRejections = 0;
+    int64_t lastPolicyRefreshMs = 0;
 
     while (m_running.load()) {
         const auto& cfg = Config::Instance().Get();
         const auto intervalMs = std::max(1000, cfg.heartbeatReportIntervalMs);
         std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+
+        const int64_t nowMs = UnixTimeMsNow();
+        if (nowMs - lastPolicyRefreshMs >= std::max(1000, cfg.policyRefreshIntervalMs)) {
+            RefreshTrafficPolicy();
+            lastPolicyRefreshMs = nowMs;
+        }
 
         if (cfg.gameServerApiKey.empty()) {
             LOG_WARN("game_server_api_key is empty; skipping heartbeat report");
@@ -458,8 +539,6 @@ void ServerCore::RegistryThread()
             headers);
 
         m_lastControlPlaneStatusCode.store(resp.statusCode, std::memory_order_relaxed);
-        auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
         m_lastControlPlaneReportUnixMs.store(nowMs, std::memory_order_relaxed);
 
         if (!resp.ok()) {
@@ -470,5 +549,68 @@ void ServerCore::RegistryThread()
                      << " recentConnections=" << recentConnections
                      << " recentRejections=" << recentRejections);
         }
+    }
+}
+
+bool ServerCore::ConsumeGlobalConnectionToken()
+{
+    const int limitPerMinute = m_policyMaxConnectionsPerMinuteTotal.load(std::memory_order_relaxed);
+    if (limitPerMinute <= 0) {
+        return true;
+    }
+
+    const int64_t nowMs = UnixTimeMsNow();
+    const int refillWindowMs = 60000;
+    int64_t last = m_globalConnLastRefillMs.load(std::memory_order_relaxed);
+    if (last == 0) {
+        m_globalConnTokens.store(limitPerMinute, std::memory_order_relaxed);
+        m_globalConnLastRefillMs.store(nowMs, std::memory_order_relaxed);
+    } else if (nowMs - last >= refillWindowMs) {
+        m_globalConnTokens.store(limitPerMinute, std::memory_order_relaxed);
+        m_globalConnLastRefillMs.store(nowMs, std::memory_order_relaxed);
+    }
+
+    int prev = m_globalConnTokens.fetch_sub(1, std::memory_order_relaxed);
+    return prev > 0;
+}
+
+void ServerCore::RefreshTrafficPolicy()
+{
+    const auto& cfg = Config::Instance().Get();
+    if (cfg.gameServerApiKey.empty()) {
+        return;
+    }
+
+    HttpClient::Headers headers = {
+        {"X-Api-Key", cfg.gameServerApiKey},
+    };
+
+    auto resp = HttpClient::Get(
+        cfg.apiGatewayHost,
+        cfg.apiGatewayPort,
+        "/api/game-servers/traffic-policy",
+        cfg.controlPlaneTimeoutMs,
+        headers);
+
+    m_lastPolicyPullStatusCode.store(resp.statusCode, std::memory_order_relaxed);
+    m_lastPolicyPullUnixMs.store(UnixTimeMsNow(), std::memory_order_relaxed);
+
+    if (!resp.ok()) {
+        LOG_WARN("Traffic policy pull failed (status=" << resp.statusCode << ", body=" << resp.body << ")");
+        return;
+    }
+
+    int maxConnPerMinuteTotal = 0;
+    if (TryParseJsonIntByKey(resp.body, "maxConnectionsPerMinuteTotal", maxConnPerMinuteTotal) && maxConnPerMinuteTotal > 0) {
+        m_policyMaxConnectionsPerMinuteTotal.store(maxConnPerMinuteTotal, std::memory_order_relaxed);
+        // 정책이 바뀌면 다음 윈도우부터 즉시 반영되도록 토큰을 리셋합니다.
+        m_globalConnTokens.store(maxConnPerMinuteTotal, std::memory_order_relaxed);
+        m_globalConnLastRefillMs.store(UnixTimeMsNow(), std::memory_order_relaxed);
+        LOG_INFO("Traffic policy applied: maxConnectionsPerMinuteTotal=" << maxConnPerMinuteTotal);
+    } else if (IsJsonNullByKey(resp.body, "maxConnectionsPerMinuteTotal")) {
+        m_policyMaxConnectionsPerMinuteTotal.store(0, std::memory_order_relaxed);
+        m_globalConnTokens.store(0, std::memory_order_relaxed);
+        m_globalConnLastRefillMs.store(UnixTimeMsNow(), std::memory_order_relaxed);
+        LOG_INFO("Traffic policy applied: maxConnectionsPerMinuteTotal=unlimited");
     }
 }

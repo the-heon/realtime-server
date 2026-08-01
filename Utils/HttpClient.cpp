@@ -14,9 +14,10 @@ std::wstring HttpClient::ToWide(const std::string& s)
 }
 
 HttpClient::Response HttpClient::Get(const std::string& host, int port,
-                                      const std::string& path, int timeoutMs)
+                                      const std::string& path, int timeoutMs,
+                                      const Headers& headers)
 {
-    return DoRequest("GET", host, port, path, "", timeoutMs);
+    return DoRequest("GET", host, port, path, "", timeoutMs, headers);
 }
 
 HttpClient::Response HttpClient::Post(const std::string& host, int port,

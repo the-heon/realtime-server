@@ -52,8 +52,15 @@ private:
     HealthServer m_healthServer;
     std::atomic<int> m_lastControlPlaneStatusCode{ 0 };
     std::atomic<int64_t> m_lastControlPlaneReportUnixMs{ 0 };
+    std::atomic<int> m_lastPolicyPullStatusCode{ 0 };
+    std::atomic<int64_t> m_lastPolicyPullUnixMs{ 0 };
+    std::atomic<int> m_policyMaxConnectionsPerMinuteTotal{ 0 };
+    std::atomic<int> m_globalConnTokens{ 0 };
+    std::atomic<int64_t> m_globalConnLastRefillMs{ 0 };
 
     void RegistryThread(); // api-gateway를 통해 api-server로 heartbeat 전송
+    bool ConsumeGlobalConnectionToken();
+    void RefreshTrafficPolicy();
 
     // JSON 직렬화 없이 간단히 문자열 조합
     static std::string BuildJson(const std::string& key, const std::string& val)
