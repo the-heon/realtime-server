@@ -3,9 +3,10 @@
 #include <ws2tcpip.h>
 #include <string>
 
-void HealthServer::Start(int port, MetricsFn fn)
+void HealthServer::Start(int port, HealthFn healthFn, MetricsFn metricsFn)
 {
-    m_metricsFn = std::move(fn);
+    m_healthFn = std::move(healthFn);
+    m_metricsFn = std::move(metricsFn);
     m_running.store(true);
 
     m_listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -54,12 +55,24 @@ void HealthServer::WorkerLoop()
         SOCKET client = accept(m_listenSocket, nullptr, nullptr);
         if (client == INVALID_SOCKET) continue; // timeout or stop
 
-        // 요청 전체를 읽지 않고 바로 응답 (헬스체크는 method/path 무관)
-        std::string body = m_metricsFn ? m_metricsFn() : "{\"status\":\"ok\"}";
+        char requestBuf[1024] = {};
+        int received = recv(client, requestBuf, sizeof(requestBuf) - 1, 0);
+        std::string request = received > 0 ? std::string(requestBuf, received) : "";
+
+        bool metricsPath = request.rfind("GET /metrics", 0) == 0;
+        std::string body;
+        std::string contentType;
+        if (metricsPath) {
+            body = m_metricsFn ? m_metricsFn() : "";
+            contentType = "text/plain; version=0.0.4";
+        } else {
+            body = m_healthFn ? m_healthFn() : "{\"status\":\"ok\"}";
+            contentType = "application/json";
+        }
 
         std::string response =
             "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
+            "Content-Type: " + contentType + "\r\n"
             "Content-Length: " + std::to_string(body.size()) + "\r\n"
             "Connection: close\r\n"
             "\r\n" + body;

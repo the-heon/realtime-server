@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <string>
+#include <cstdint>
 #include "ServerSession.h"
 #include "../Packet/PacketManager.h"
 #include "../Utils/HealthServer.h"
@@ -49,11 +50,10 @@ private:
     std::thread              m_registryThread;
 
     HealthServer m_healthServer;
-    std::string  m_gameServerId; // session-server에서 발급받은 서버 ID
+    std::atomic<int> m_lastControlPlaneStatusCode{ 0 };
+    std::atomic<int64_t> m_lastControlPlaneReportUnixMs{ 0 };
 
-    void RegistryThread(); // session-server에 heartbeat 전송
-    void RegisterWithSessionServer();
-    void UnregisterFromSessionServer();
+    void RegistryThread(); // api-gateway를 통해 api-server로 heartbeat 전송
 
     // JSON 직렬화 없이 간단히 문자열 조합
     static std::string BuildJson(const std::string& key, const std::string& val)

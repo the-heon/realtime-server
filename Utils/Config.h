@@ -2,6 +2,7 @@
 #include <string>
 #include <unordered_map>
 #include <fstream>
+#include <cstdlib>
 
 struct ServerConfig
 {
@@ -33,6 +34,14 @@ struct ServerConfig
     // 룸 GC
     int idleRoomTimeoutMs            = 60000; // 빈 룸 유지 시간 (ms)
     int reconnectWindowMs            = 30000; // 재접속 허용 시간 (ms)
+
+    // control-plane 연동 (api-gateway를 통해 api-server heartbeat 보고)
+    std::string apiGatewayHost       = "127.0.0.1";
+    int         apiGatewayPort       = 5000;
+    std::string gameServerApiKey     = "";
+    std::string gameServerVersion    = "dev";
+    int         controlPlaneTimeoutMs = 3000;
+    int         heartbeatReportIntervalMs = 10000;
 };
 
 // key=value 형식 설정 파일 로더. 파일이 없으면 기본값 유지.
@@ -104,6 +113,20 @@ private:
         m_cfg.packetRateLimitPerSec  = getInt("packet_rate_limit_per_sec",       m_cfg.packetRateLimitPerSec);
         m_cfg.idleRoomTimeoutMs      = getInt("idle_room_timeout_ms",            m_cfg.idleRoomTimeoutMs);
         m_cfg.reconnectWindowMs      = getInt("reconnect_window_ms",             m_cfg.reconnectWindowMs);
+        m_cfg.apiGatewayHost         = getStrOrDefault("api_gateway_host",       m_cfg.apiGatewayHost);
+        m_cfg.apiGatewayPort         = getInt("api_gateway_port",                m_cfg.apiGatewayPort);
+        m_cfg.gameServerApiKey       = getStrOrDefault("game_server_api_key",    m_cfg.gameServerApiKey);
+        m_cfg.gameServerVersion      = getStrOrDefault("game_server_version",    m_cfg.gameServerVersion);
+        m_cfg.controlPlaneTimeoutMs  = getInt("control_plane_timeout_ms",        m_cfg.controlPlaneTimeoutMs);
+        m_cfg.heartbeatReportIntervalMs = getInt("heartbeat_report_interval_ms", m_cfg.heartbeatReportIntervalMs);
+
+        // 배포 환경에서는 파일 대신 환경변수로 API 키를 주입할 수 있게 허용
+        if (m_cfg.gameServerApiKey.empty()) {
+            const char* envApiKey = std::getenv("GAME_SERVER_API_KEY");
+            if (envApiKey != nullptr) {
+                m_cfg.gameServerApiKey = envApiKey;
+            }
+        }
     }
 
     static std::string Trim(const std::string& s)
