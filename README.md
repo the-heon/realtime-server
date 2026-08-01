@@ -48,3 +48,10 @@
 4. `game_server_version`
 
 heartbeat payload에는 현재 접속자 수, 최대 인원, 최근 연결/거부 통계가 포함됩니다.
+
+추가 동작:
+
+1. `GET /api/game-servers/traffic-policy`를 주기적으로 조회합니다.
+2. 응답의 `maxConnectionsPerMinuteTotal`이 설정되어 있으면,
+   실시간 서버는 분당 신규 연결 수를 런타임에서 제한합니다.
+3. 제한 초과 시 연결은 즉시 종료되며 `realtime_policy_connection_rejections_total`로 집계됩니다.

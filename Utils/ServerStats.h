@@ -22,6 +22,7 @@ public:
     std::atomic<uint64_t> totalBytesSent{0};
     std::atomic<uint64_t> totalRateLimitRejections{0};
     std::atomic<uint64_t> totalOversizedPacketRejections{0};
+    std::atomic<uint64_t> totalPolicyConnectionRejections{0};
 
     void Print() const
     {
@@ -33,7 +34,8 @@ public:
             << " bytes_recv=" << totalBytesReceived.load(std::memory_order_relaxed)
                 << " bytes_sent=" << totalBytesSent.load(std::memory_order_relaxed)
                 << " reject_rate=" << totalRateLimitRejections.load(std::memory_order_relaxed)
-                << " reject_oversize=" << totalOversizedPacketRejections.load(std::memory_order_relaxed));
+                    << " reject_oversize=" << totalOversizedPacketRejections.load(std::memory_order_relaxed)
+                    << " reject_policy_conn=" << totalPolicyConnectionRejections.load(std::memory_order_relaxed));
     }
 
 private:

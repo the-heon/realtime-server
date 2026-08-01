@@ -42,6 +42,7 @@ struct ServerConfig
     std::string gameServerVersion    = "dev";
     int         controlPlaneTimeoutMs = 3000;
     int         heartbeatReportIntervalMs = 10000;
+    int         policyRefreshIntervalMs = 30000;
 };
 
 // key=value 형식 설정 파일 로더. 파일이 없으면 기본값 유지.
@@ -119,6 +120,7 @@ private:
         m_cfg.gameServerVersion      = getStrOrDefault("game_server_version",    m_cfg.gameServerVersion);
         m_cfg.controlPlaneTimeoutMs  = getInt("control_plane_timeout_ms",        m_cfg.controlPlaneTimeoutMs);
         m_cfg.heartbeatReportIntervalMs = getInt("heartbeat_report_interval_ms", m_cfg.heartbeatReportIntervalMs);
+        m_cfg.policyRefreshIntervalMs = getInt("policy_refresh_interval_ms",     m_cfg.policyRefreshIntervalMs);
 
         // 배포 환경에서는 파일 대신 환경변수로 API 키를 주입할 수 있게 허용
         if (m_cfg.gameServerApiKey.empty()) {

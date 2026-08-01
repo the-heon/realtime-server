@@ -26,7 +26,8 @@ public:
 
     // 동기 GET 요청. 실패 시 statusCode=0 반환.
     static Response Get(const std::string& host, int port,
-                        const std::string& path, int timeoutMs = 3000);
+                        const std::string& path, int timeoutMs = 3000,
+                        const Headers& headers = {});
 
     // 동기 POST 요청 (Content-Type: application/json). 실패 시 statusCode=0 반환.
     static Response Post(const std::string& host, int port,
